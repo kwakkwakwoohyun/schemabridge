@@ -1,0 +1,5 @@
+{
+  "entries": [
+    {"table": "BIZ_INCOME", "column": "income_cd", "note": "TO-BE income_type_cd 공통코드와 매핑 확인됨(INCOME_TYPE 코드그룹)"}
+  ]
+}

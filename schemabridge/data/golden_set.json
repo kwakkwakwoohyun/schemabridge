@@ -1,0 +1,18 @@
+[
+  {"to_be_column": "ACC_WHT_AGG.pay_dt", "expected_status": "confirmed", "note": "후보 1개, 타입 일치, 설명 있음"},
+  {"to_be_column": "ACC_WHT_AGG.payee_nm", "expected_status": "confirmed", "note": "후보 1개, 타입 일치, 설명 있음"},
+  {"to_be_column": "ACC_WHT_AGG.income_type_cd", "expected_status": "confirmed", "note": "코드값 일치로 강한 근거 확보"},
+  {"to_be_column": "ACC_WHT_AGG.pay_amt", "expected_status": "confirmed", "note": "후보 1개, 타입 일치(설명은 없지만 대안이 없어 확정)"},
+
+  {"to_be_column": "ACC_WHT_AGG.wht_tax_amt", "expected_status": "ambiguous", "note": "두 후보 모두 설명 있고 비슷함('원천징수세액'/'원천세액'), 코드매핑 없어 우열 못 가림"},
+  {"to_be_column": "ACC_WHT_AGG.tax_rate", "expected_status": "ambiguous", "note": "같은 테이블 내 유사한 코드성 컬럼 2개, 설명 없음"},
+  {"to_be_column": "ACC_WHT_AGG.payee_biz_no", "expected_status": "ambiguous", "note": "두 후보가 구조적으로 동일(같은 컬럼명), 설명 없음"},
+
+  {"to_be_column": "ACC_WHT_AGG.div_wht_amt", "expected_status": "insufficient_metadata", "note": "후보의 데이터 타입 정보 자체가 없어 필수조건 판정 불가"},
+  {"to_be_column": "ACC_WHT_AGG.div_payee_nm", "expected_status": "insufficient_metadata", "note": "두 후보 모두 설명 없음, 데이터 샘플로 자체추론 필요(다음 단계)"},
+
+  {"to_be_column": "ACC_WHT_AGG.updt_dt", "expected_status": "no_match", "note": "매핑정의서에 해당 컬럼 자체가 없음"},
+  {"to_be_column": "ACC_WHT_AGG.biz_reg_no", "expected_status": "no_match", "note": "매핑정의서에 해당 컬럼 자체가 없음"},
+
+  {"to_be_column": "ACC_WHT_AGG.reg_dt", "expected_status": "version_mismatch", "note": "매핑정의서가 가리키는 LBR_WHT.input_dt가 현재 AS-IS 스키마에 없음(스키마 변경으로 컬럼명이 바뀌었거나 삭제됨)"}
+]

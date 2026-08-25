@@ -1,0 +1,75 @@
+{
+  "TO-BE": {
+    "ACC_WHT_AGG": {
+      "columns": {
+        "pay_dt": {"type": "DATE", "description": "지급일자"},
+        "payee_nm": {"type": "TEXT", "description": "지급처명"},
+        "income_type_cd": {"type": "TEXT", "description": "소득구분코드", "fk": "COM_CODE"},
+        "pay_amt": {"type": "NUMERIC", "description": "지급액"},
+        "wht_tax_amt": {"type": "NUMERIC", "description": "원천징수세액"},
+        "tax_rate": {"type": "TEXT", "description": "적용 세율 코드", "fk": "COM_CODE"},
+        "payee_biz_no": {"type": "TEXT", "description": "지급처 사업자번호"},
+        "reg_dt": {"type": "DATE", "description": "등록일자"},
+        "updt_dt": {"type": "DATE", "description": "수정일자"},
+        "biz_reg_no": {"type": "TEXT", "description": "사업자등록번호"},
+        "div_wht_amt": {"type": "NUMERIC", "description": "배당소득 원천징수세액"},
+        "div_payee_nm": {"type": "TEXT", "description": "배당 지급처명"}
+      }
+    }
+  },
+  "AS-IS": {
+    "LBR_WHT": {
+      "owner": "계정계 원장팀",
+      "columns": {
+        "pay_dt": {"type": "DATE", "description": "지급일자"},
+        "emp_nm": {"type": "TEXT", "description": null, "sample_data": ["김민준", "이서연", "박도윤"]},
+        "pay_amt": {"type": "NUMERIC", "description": "지급 급여액"},
+        "wht_amt": {"type": "NUMERIC", "description": "원천징수세액"},
+        "tax_rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["R01", "R02"]},
+        "std_rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["S01", "S02"]}
+      }
+    },
+    "INT_WHT": {
+      "owner": "계정계 원장팀",
+      "columns": {
+        "pay_dt": {"type": "DATE", "description": "지급일자"},
+        "acct_nm": {"type": "TEXT", "description": null, "sample_data": ["최지우", "정하윤"]},
+        "pay_amt": {"type": "NUMERIC", "description": null, "sample_data": [1500000, 820000]},
+        "wht_amt": {"type": "NUMERIC", "description": "원천세액"},
+        "rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["R01"]}
+      }
+    },
+    "DIV_WHT": {
+      "owner": "계정계 원장팀",
+      "columns": {
+        "pay_dt": {"type": "DATE", "description": null, "sample_data": ["2026-03-10", "2026-03-11"]},
+        "acct_nm": {"type": "TEXT", "description": null, "sample_data": ["강시우", "윤예준"]},
+        "acct_no": {"type": "TEXT", "description": null, "sample_data": ["110-234-5678"]},
+        "pay_amt": {"type": "NUMERIC", "description": null, "sample_data": [300000, 450000]},
+        "wht_amt": {"type": null, "description": null, "sample_data": [46200, 69300]}
+      }
+    },
+    "ETC_INCOME": {
+      "owner": "회계팀",
+      "columns": {
+        "pay_dt": {"type": "DATE", "description": "지급일자"},
+        "payee_nm": {"type": "TEXT", "description": "지급처명"},
+        "payee_biz_no": {"type": "TEXT", "description": null, "sample_data": ["123-45-67890"]},
+        "pay_amt": {"type": "NUMERIC", "description": "지급액"},
+        "wht_amt": {"type": "NUMERIC", "description": "원천징수세액"},
+        "income_cd": {"type": "TEXT", "description": "소득 구분 코드", "fk": "COM_CODE"}
+      }
+    },
+    "BIZ_INCOME": {
+      "owner": "회계팀",
+      "columns": {
+        "pay_dt": {"type": "DATE", "description": "지급일자"},
+        "payee_nm": {"type": "TEXT", "description": "지급처명"},
+        "payee_biz_no": {"type": "TEXT", "description": null, "sample_data": ["987-65-43210"]},
+        "pay_amt": {"type": "NUMERIC", "description": "지급액"},
+        "wht_amt": {"type": "NUMERIC", "description": "원천징수세액"},
+        "income_cd": {"type": "TEXT", "description": "소득 구분 코드", "fk": "COM_CODE"}
+      }
+    }
+  }
+}

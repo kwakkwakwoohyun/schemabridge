@@ -1,0 +1,34 @@
+{
+  "source_version": "mapping_def_v1.3",
+  "entries": [
+    {"to_be_column": "ACC_WHT_AGG.pay_dt", "candidates": [{"table": "LBR_WHT", "column": "pay_dt"}]},
+    {"to_be_column": "ACC_WHT_AGG.payee_nm", "candidates": [{"table": "ETC_INCOME", "column": "payee_nm"}]},
+    {"to_be_column": "ACC_WHT_AGG.income_type_cd", "candidates": [{"table": "BIZ_INCOME", "column": "income_cd"}]},
+    {"to_be_column": "ACC_WHT_AGG.pay_amt", "candidates": [{"table": "INT_WHT", "column": "pay_amt"}]},
+
+    {"to_be_column": "ACC_WHT_AGG.wht_tax_amt", "candidates": [
+      {"table": "LBR_WHT", "column": "wht_amt"},
+      {"table": "INT_WHT", "column": "wht_amt"}
+    ]},
+    {"to_be_column": "ACC_WHT_AGG.tax_rate", "candidates": [
+      {"table": "LBR_WHT", "column": "tax_rate_cd"},
+      {"table": "LBR_WHT", "column": "std_rate_cd"}
+    ]},
+    {"to_be_column": "ACC_WHT_AGG.payee_biz_no", "candidates": [
+      {"table": "ETC_INCOME", "column": "payee_biz_no"},
+      {"table": "BIZ_INCOME", "column": "payee_biz_no"}
+    ]},
+
+    {"to_be_column": "ACC_WHT_AGG.div_wht_amt", "candidates": [
+      {"table": "DIV_WHT", "column": "wht_amt"}
+    ]},
+    {"to_be_column": "ACC_WHT_AGG.div_payee_nm", "candidates": [
+      {"table": "DIV_WHT", "column": "acct_nm"},
+      {"table": "DIV_WHT", "column": "acct_no"}
+    ]},
+
+    {"to_be_column": "ACC_WHT_AGG.reg_dt", "candidates": [
+      {"table": "LBR_WHT", "column": "input_dt"}
+    ]}
+  ]
+}

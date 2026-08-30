@@ -5,8 +5,9 @@ SchemaBridge 데모 뷰어 (시연 영상용)
 src/lookup.py, src/filters.py, src/code_match.py를 그대로 재사용합니다 —
 이미 골든셋 12건으로 검증된 결정적 로직이라 여기서 다시 만들지 않습니다.
 
-LLM 판정 노드(judge_and_rank 등)는 아직 미구현이라, 그 판단이 필요한
-케이스는 결과를 지어내지 않고 "PENDING"으로 정직하게 표시합니다.
+infer_secondary_evidence(임베딩 유사도/LLM 자체추론)는 구현되어 후보별 점수를
+보여주지만, 최종 확정 노드(judge_and_rank)는 아직 없어서 순위만 보여주고
+"PENDING"으로 정직하게 표시합니다.
 
 실행: streamlit run app.py
 """
@@ -16,6 +17,7 @@ import streamlit as st
 from src.lookup import lookup_mapping_candidates
 from src.filters import filter_by_type
 from src.code_match import check_code_match
+from src.evidence import infer_secondary_evidence
 
 
 def preliminary_status(lookup_result, filter_result, code_results):
@@ -90,8 +92,22 @@ if st.button("매핑 후보 조회", type="primary") and to_be_column:
                     st.write(f"- {e['candidate']['table']}.{e['candidate']['column']}: {e['reason']}")
 
         if "PENDING" in status:
+            with st.spinner("infer_secondary_evidence 실행 중 (Azure OpenAI 호출)..."):
+                evidence_result = infer_secondary_evidence(to_be_column, filter_result["filtered"])
+
+            st.subheader("근거 스코어링 결과 (infer_secondary_evidence)")
+            st.table([
+                {
+                    "테이블": s["table"],
+                    "컬럼": s["column"],
+                    "점수": s["score"],
+                    "근거 출처": s["evidence_source"],
+                    "판단 근거": s["rationale"],
+                }
+                for s in evidence_result["evidence_scores"]
+            ])
             st.info(
-                "이 케이스는 근거가 여러 개로 갈리거나(Ambiguous) 설명이 없어(Insufficient-Metadata) "
-                "LLM 판정 노드(infer_secondary_evidence → judge_and_rank)가 최종 판단해야 합니다. "
-                "아직 구현 전이라 여기서 임의로 순위를 확정하지 않습니다."
+                "여기까지가 근거 스코어링 결과입니다. 최종 confirmed/ambiguous 확정과 "
+                "사람에게 되묻는 로직(judge_and_rank/request_clarification)은 아직 구현 전이라 "
+                "여기서 임의로 순위를 확정하지 않습니다."
             )

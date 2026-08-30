@@ -1,17 +1,20 @@
 """
 LangGraph 그래프 조립 지점 (엔트리포인트).
 
-4주차 설계상의 전체 그래프 중, 지금 실제로 구현된 결정적 노드 3개
-(lookup_mapping_candidates -> filter_by_type -> check_code_match)만 연결한다.
+4주차 설계상의 전체 그래프 중, 지금까지 구현된 노드
+(lookup_mapping_candidates -> filter_by_type -> check_code_match -> infer_secondary_evidence)를 연결한다.
 
 - classify_intent, SC-002 체인(search_schema 이하)은 아직 아무 구현도 없으므로 포함하지 않았다.
-- infer_secondary_evidence/judge_and_rank/request_clarification/generate_rationale(전부 LLM 필요)도
-  아직 없다. 이 부분이 필요한 케이스는 확정하지 않고 "await_llm_judgment"에서 PENDING으로 멈춘다.
+- infer_secondary_evidence(LLM 임베딩 유사도 / 자체추론)는 구현되어 후보에 score/rationale을
+  붙이지만, 그 점수로 최종 confirmed/ambiguous를 확정하는 judge_and_rank는 아직 없다.
+  이 부분이 필요한 케이스는 "await_llm_judgment"에서 evidence_scores를 노출한 채 PENDING으로 멈춘다.
+  request_clarification/generate_rationale도 아직 없다.
 - 즉 이 그래프가 낼 수 있는 결론은 confirmed / no_match / version_mismatch /
   insufficient_metadata / pending_llm 다섯 가지뿐이며, ambiguous 최종 판정은 아직 못 낸다
   (judge_and_rank가 있어야 나옴).
 
-실행하려면 langgraph 패키지가 필요하다: pip install langgraph
+실행하려면 langgraph, openai, python-dotenv 패키지가 필요하고,
+infer_secondary_evidence 실행 시 schemabridge/.env에 Azure OpenAI 설정이 있어야 한다.
 """
 
 import json
@@ -24,6 +27,7 @@ from langgraph.graph import END, START, StateGraph
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.code_match import check_code_match
+from src.evidence import infer_secondary_evidence
 from src.filters import filter_by_type
 from src.lookup import lookup_mapping_candidates
 
@@ -37,6 +41,7 @@ class AgentState(TypedDict, total=False):
     excluded_candidates: list[dict]
     unknown_type: list[dict]
     code_match_results: list[dict]
+    evidence_scores: list[dict]
     route: str  # 각 노드가 다음 목적지(노드 이름)를 직접 써넣는 내부 신호
     exception_status: str | None
     final_answer: dict
@@ -44,6 +49,7 @@ class AgentState(TypedDict, total=False):
 
 def lookup_node(state: AgentState) -> dict:
     result = lookup_mapping_candidates(state["to_be_column"])
+    # lookup_mapping_candidates 를 실행하고 result의 status_hint 값을 보고 다음 노드는 어디로갈지 판단
     route = "handle_exception" if result["status_hint"] in ("no_match", "version_mismatch") else "filter_by_type"
     return {
         "candidates": result["candidates"],
@@ -55,8 +61,11 @@ def lookup_node(state: AgentState) -> dict:
 
 def filter_node(state: AgentState) -> dict:
     result = filter_by_type(state["to_be_column"], state["candidates"])
+
+    # 타입 불일치시 handle_exception 노드로
     if not result["filtered"] or result["unknown_type"]:
         route = "handle_exception"
+    # 타입 일치시 check_code_match 노드로
     else:
         route = "check_code_match"
     return {
@@ -73,8 +82,13 @@ def code_match_node(state: AgentState) -> dict:
     if len(state["filtered_candidates"]) == 1 or len(matched) == 1:
         route = "format_response"
     else:
-        route = "await_llm_judgment"
+        route = "infer_secondary_evidence"
     return {"code_match_results": results, "route": route}
+
+
+def infer_secondary_evidence_node(state: AgentState) -> dict:
+    result = infer_secondary_evidence(state["to_be_column"], state["filtered_candidates"])
+    return {"evidence_scores": result["evidence_scores"]}
 
 
 def handle_exception_node(state: AgentState) -> dict:
@@ -122,15 +136,17 @@ def format_response_node(state: AgentState) -> dict:
 
 
 def await_llm_judgment_node(state: AgentState) -> dict:
-    candidates = [f"{c['table']}.{c['column']}" for c in state["filtered_candidates"]]
+    # judge_and_rank가 아직 없어서, infer_secondary_evidence가 매긴 점수를 그대로
+    # 노출만 하고 최종 확정은 아직 하지 않는다. judge_and_rank 구현 시 이 노드는
+    # evidence_scores를 입력으로 받아 confirmed/ambiguous 최종 판정을 내리도록 대체된다.
     return {
         "exception_status": "pending_llm",
         "final_answer": {
             "to_be_column": state["to_be_column"],
             "status": "pending_llm",
-            "candidates": candidates,
-            "reason": "결정적 로직만으로는 후보 우열을 가릴 수 없음. "
-            "infer_secondary_evidence/judge_and_rank(LLM) 구현 후 재판정 필요",
+            "evidence_scores": state.get("evidence_scores", []),
+            "reason": "infer_secondary_evidence까지 근거 스코어링 완료. "
+            "judge_and_rank(LLM) 구현 후 최종 확정 필요",
         },
     }
 
@@ -143,6 +159,7 @@ def build_graph():
     graph.add_node("check_code_match", code_match_node)
     graph.add_node("handle_exception", handle_exception_node)
     graph.add_node("format_response", format_response_node)
+    graph.add_node("infer_secondary_evidence", infer_secondary_evidence_node)
     graph.add_node("await_llm_judgment", await_llm_judgment_node)
 
     graph.add_edge(START, "lookup_mapping_candidates")
@@ -162,8 +179,9 @@ def build_graph():
     graph.add_conditional_edges(
         "check_code_match",
         lambda s: s["route"],
-        {"format_response": "format_response", "await_llm_judgment": "await_llm_judgment"},
+        {"format_response": "format_response", "infer_secondary_evidence": "infer_secondary_evidence"},
     )
+    graph.add_edge("infer_secondary_evidence", "await_llm_judgment")
     graph.add_edge("handle_exception", END)
     graph.add_edge("format_response", END)
     graph.add_edge("await_llm_judgment", END)

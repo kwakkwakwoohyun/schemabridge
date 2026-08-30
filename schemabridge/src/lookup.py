@@ -12,8 +12,12 @@ from src.data_loader import get_column_info, load_mapping_definition, load_schem
 
 
 def lookup_mapping_candidates(to_be_column: str) -> dict:
+    # data/mapping_definition.json(매핑정의서) 파일을 dict로 반환
     mapping_def = load_mapping_definition()
+
+    # data/schema.json(TO-BE/AS-IS 테이블 스키마 전체)을 읽어서 dict로 반환
     schema = load_schema()
+
     source_version = mapping_def.get("source_version")
 
     entry = next(
@@ -26,7 +30,7 @@ def lookup_mapping_candidates(to_be_column: str) -> dict:
             "to_be_column": to_be_column,
             "candidates": [],
             "source_version": source_version,
-            "status_hint": "no_match",  # 후보 자체가 매핑정의서에 없음
+            "status_hint": "no_match",  # 후보 자체(사용자 입력)가 매핑정의서에 없음
         }
 
     candidates = []
@@ -47,8 +51,10 @@ def lookup_mapping_candidates(to_be_column: str) -> dict:
         })
 
     status_hint = None
+    # 매핑정의서는 있는데 스키마엔 없으면 -> 스키마가 바꼈는데 매핑정의서가 최신화 안되있는 경우
     if version_mismatch_found and not candidates:
         status_hint = "version_mismatch"
+    # 매핑정의서에 등록돼 있는데, 거기 달린 후보 리스트가 텅 비어있는 경우(데이터 이상 케이스를 방어하는 코드)
     elif not candidates:
         status_hint = "no_match"
 

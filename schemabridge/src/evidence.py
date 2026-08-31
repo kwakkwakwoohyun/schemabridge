@@ -59,17 +59,23 @@ def infer_secondary_evidence(to_be_column: str, filtered_candidates: list[dict])
     to_be_description = to_be_info.get("description")
 
     if to_be_description:
+        # ASIS 후보도 설명이 있는 애들 -> TOBE 설명 vs ASIS 설명 임베딩 코사인 유사도 비교
         with_desc = [c for c in filtered_candidates if c.get("description")]
+        # ASIS 후보에 설명이 없는 애들 -> 컬럼명/타입/샘플값으로 LLM이 추론
         without_desc = [c for c in filtered_candidates if not c.get("description")]
     else:
         # TO-BE 자체에 설명이 없으면 유사도 비교 기준이 없으므로 전부 자체추론으로 보낸다.
         with_desc, without_desc = [], filtered_candidates
 
     scores = []
+    # ASIS Description 이 있으면 (비교대상있음 벡터 유사도)
     if with_desc:
+        # 벡터 유사도 비교
         scores.extend(_score_by_description_similarity(to_be_description, with_desc))
+    # TOBE Desc는 있는데 ASIS가 없는경우 + TOBE Desc부터 없는 경우
     if without_desc:
         confirmed_hints = _get_confirmed_mappings(exclude_column=to_be_column)
+        # 자체추론
         scores.extend(_score_by_self_inference(to_be_column, to_be_description, without_desc, confirmed_hints))
 
     scores.sort(key=lambda s: s["score"], reverse=True)
@@ -82,7 +88,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     norm_b = sum(y * y for y in b) ** 0.5
     return dot / (norm_a * norm_b)
 
-
+# 벡터 유사도 검색?
 def _score_by_description_similarity(to_be_description: str, candidates: list[dict]) -> list[dict]:
     texts = [to_be_description] + [c["description"] for c in candidates]
     vectors = embed(texts)
@@ -100,7 +106,7 @@ def _score_by_description_similarity(to_be_description: str, candidates: list[di
         })
     return scores
 
-
+# 자체추론
 def _score_by_self_inference(
     to_be_column: str,
     to_be_description: str | None,

@@ -5,9 +5,11 @@ SchemaBridge 데모 뷰어 (시연 영상용)
 src/lookup.py, src/filters.py, src/code_match.py를 그대로 재사용합니다 —
 이미 골든셋 12건으로 검증된 결정적 로직이라 여기서 다시 만들지 않습니다.
 
-infer_secondary_evidence(임베딩 유사도/LLM 자체추론)는 구현되어 후보별 점수를
-보여주지만, 최종 확정 노드(judge_and_rank)는 아직 없어서 순위만 보여주고
-"PENDING"으로 정직하게 표시합니다.
+결정적 로직(lookup/filter/code_match)만으로 판정이 안 나는 경우
+infer_secondary_evidence(임베딩 유사도/LLM 자체추론) -> judge_and_rank(confidence_gap
+기준 최종 확정)까지 그대로 이어서 호출한다. request_clarification(사람에게 되묻기)은
+아직 없어서, judge_and_rank가 ambiguous/insufficient_metadata로 판정하면 그 결과만
+정직하게 보여주고 멈춘다.
 
 실행: streamlit run app.py
 """
@@ -18,6 +20,7 @@ from src.lookup import lookup_mapping_candidates
 from src.filters import filter_by_type
 from src.code_match import check_code_match
 from src.evidence import infer_secondary_evidence
+from src.judge import judge_and_rank
 
 
 def preliminary_status(lookup_result, filter_result, code_results):
@@ -66,8 +69,10 @@ if st.button("매핑 후보 조회", type="primary") and to_be_column:
         code_results = check_code_match(filter_result["filtered"])
         status = preliminary_status(lookup_result, filter_result, code_results)
 
-        st.subheader("판정 상태")
+        st.subheader("1차 판정 (결정적 로직)")
         st.code(status)
+        if "PENDING" in status:
+            st.caption("결정적 로직만으로는 확정 불가 — 아래에서 근거 스코어링 + 최종 판정을 이어서 진행합니다.")
 
         st.subheader("AS-IS 후보")
         matched_map = {(r["table"], r["column"]): r["matched"] for r in code_results}
@@ -106,8 +111,26 @@ if st.button("매핑 후보 조회", type="primary") and to_be_column:
                 }
                 for s in evidence_result["evidence_scores"]
             ])
-            st.info(
-                "여기까지가 근거 스코어링 결과입니다. 최종 confirmed/ambiguous 확정과 "
-                "사람에게 되묻는 로직(judge_and_rank/request_clarification)은 아직 구현 전이라 "
-                "여기서 임의로 순위를 확정하지 않습니다."
-            )
+            judged = judge_and_rank(evidence_result["evidence_scores"], code_results)
+
+            st.subheader("최종 판정 (judge_and_rank)")
+            gap = judged["confidence_gap"]
+            st.caption(f"1위·2위 점수차(confidence_gap): {gap:.0%} (확정 임계값: 10%)")
+
+            if judged["status"] == "confirmed":
+                winner = judged["winner"]
+                st.success(
+                    f"CONFIRMED — {winner['table']}.{winner['column']} "
+                    f"(점수 {winner['score']}, 근거 출처: {winner['evidence_source']})\n\n"
+                    f"{winner['rationale']}"
+                )
+            elif judged["status"] == "ambiguous":
+                st.warning(
+                    "AMBIGUOUS — 1위·2위 점수차가 임계값 미만이라 스스로 확정하지 않습니다. "
+                    "사람에게 되묻는 로직(request_clarification)이 아직 구현 전이라 여기서 멈춥니다."
+                )
+            else:
+                st.warning(
+                    "INSUFFICIENT_METADATA — 1위 후보조차 확신도가 낮아 스스로 확정하지 않습니다. "
+                    "사람에게 되묻는 로직(request_clarification)이 아직 구현 전이라 여기서 멈춥니다."
+                )

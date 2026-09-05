@@ -60,7 +60,7 @@ git 저장소입니다. 원격: `https://github.com/kwakkwakwoohyun/schemabridge
 
 ## `schemabridge/` 실행 및 테스트
 
-- `pyproject.toml`/`requirements.txt`는 아직 없습니다. 지금까지 구현된 결정적 로직(`data_loader`/`lookup`/`filters`/`code_match`)은 표준 라이브러리(`json`, `os`)만 사용하므로 외부 패키지 설치 없이 바로 실행됩니다. `langgraph`/`langchain-openai`/`openai` 등은 LLM 판정 노드를 구현할 때가 되어야 실제로 필요해집니다.
+- `schemabridge/requirements.txt`에 실제로 import되는 직접 의존성만 핀 고정(`langgraph`, `openai`, `python-dotenv`, `streamlit` — `langchain-openai`는 실제 코드 어디서도 import하지 않으므로 포함 안 함, Azure OpenAI 호출은 `openai.AzureOpenAI`를 직접 씀). `pyproject.toml`은 아직 없음(패키징이 필요 없는 PoC라 당장은 불필요, `pip install -r requirements.txt`로 충분). 결정적 로직(`data_loader`/`lookup`/`filters`/`code_match`)은 표준 라이브러리(`json`, `os`)만 쓰므로 이 설치 없이도 바로 실행됨.
 - 결정적 파이프라인 검증 스크립트 실행(사실상 유일한 "테스트"):
   ```
   cd schemabridge && python3 tests/test_deterministic.py

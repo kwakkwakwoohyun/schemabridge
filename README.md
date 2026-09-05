@@ -103,7 +103,7 @@ LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서�
 ```bash
 cd schemabridge
 python3.11 -m venv .venv
-.venv/bin/pip install langgraph langchain-openai openai python-dotenv streamlit
+.venv/bin/pip install -r requirements.txt
 
 # 결정적 파이프라인만 (외부 패키지 불필요, API 키 없이 실행 가능)
 .venv/bin/python tests/test_deterministic.py

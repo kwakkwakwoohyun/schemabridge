@@ -34,7 +34,7 @@ graph TD;
 	format_response(format_response)
 	infer_secondary_evidence(infer_secondary_evidence)
 	judge_and_rank(judge_and_rank)
-	await_clarification(await_clarification)
+	request_clarification(request_clarification)
 	__end__([__end__]):::last
 	__start__ --> lookup_mapping_candidates;
 	lookup_mapping_candidates -.-> filter_by_type;
@@ -45,16 +45,17 @@ graph TD;
 	check_code_match -.-> infer_secondary_evidence;
 	infer_secondary_evidence --> judge_and_rank;
 	judge_and_rank -.-> format_response;
-	judge_and_rank -.-> await_clarification;
+	judge_and_rank -.-> request_clarification;
+	judge_and_rank -.-> handle_exception;
+	request_clarification --> judge_and_rank;
 	format_response --> __end__;
 	handle_exception --> __end__;
-	await_clarification --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
 ```
 
-LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서·코드 매핑정의서)는 벡터 검색이 아니라 정확 조회를 쓰고, 근거가 확실한 케이스는 결정적 로직만으로 바로 확정됩니다. 후보가 여러 개인데 결정적 로직으로 못 가리면 임베딩 유사도/LLM 자체추론(`infer_secondary_evidence`)으로 점수를 매기고, 그 점수차(`confidence_gap`)를 기준으로 `judge_and_rank`가 최종 confirmed/ambiguous/insufficient_metadata를 판정합니다. `await_clarification`은 애매한 판정을 사람에게 되묻는 기능이 생기기 전까지, 임의로 확정하지 않고 정직하게 멈추는 자리표시자입니다.
+LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서·코드 매핑정의서)는 벡터 검색이 아니라 정확 조회를 쓰고, 근거가 확실한 케이스는 결정적 로직만으로 바로 확정됩니다. 후보가 여러 개인데 결정적 로직으로 못 가리면 임베딩 유사도/LLM 자체추론(`infer_secondary_evidence`)으로 점수를 매기고, 그 점수차(`confidence_gap`)를 기준으로 `judge_and_rank`가 최종 confirmed/ambiguous/insufficient_metadata를 판정합니다. confirmed가 아니면 `request_clarification`이 실제로 사람에게 되묻고 답을 반영해 재점수화한 뒤 `judge_and_rank`로 되돌아갑니다(루프, 최대 2회) — 그래도 안 풀리면 `handle_exception`이 정직하게 종료합니다.
 
 | 구분 | 선택 | 이유 |
 | --- | --- | --- |
@@ -72,8 +73,8 @@ LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서�
 - [x] `infer_secondary_evidence` — 설명 유사도(임베딩) / 설명 없을 때 자체추론(LLM, Structured Output)
 - [x] `judge_and_rank` — `confidence_gap` 기준 confirmed/ambiguous/insufficient_metadata 최종 판정
 - [x] 위 노드들을 LangGraph 그래프로 조립 (`src/graph.py`)
-- [x] Streamlit 데모 뷰어 (`app.py`) — `judge_and_rank`까지 반영해 실시간 판정 표시
-- [ ] `request_clarification` — 애매한 판정에 대해 사람에게 구체적으로 되묻는 루프(최대 2회). 지금은 `await_clarification`이 판정 결과만 노출하고 멈춤
+- [x] `request_clarification` — 애매한 판정에 대해 사람에게 구체적으로 되묻는 루프(최대 2회, 답변 반영해 재점수화 후 재판정)
+- [x] Streamlit 데모 뷰어 (`app.py`) — `judge_and_rank`/`request_clarification`까지 반영해 실시간 판정·되묻기 UI 표시(`st.session_state` 기반)
 - [ ] `generate_rationale` — 내부 추론과 분리된 사용자 노출용 근거 문장 생성
 - [ ] `classify_intent`, SC-002(신고서용 집계 쿼리 생성) 전체 — SC-001 완료 후 착수 예정
 
@@ -88,7 +89,7 @@ LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서�
 | `confirmed` | `wht_reason_cd` | 후보 2개 중 코드값 일치가 정확히 1개 — `format_response`의 코드값 disambiguation 경로 |
 | `confirmed` | `wht_tax_amt` | 후보 둘 다 설명 있음 → 임베딩 유사도(`description_similarity`)로 점수화 → `judge_and_rank`가 확정 |
 | `confirmed` | `tax_rate` / `payee_biz_no` / `div_payee_nm` | 후보에 설명 없음 → LLM 자체추론(`self_inference`)으로 점수화 → `judge_and_rank`가 확정 |
-| `ambiguous` | `settle_method_cd` | 후보 3개 중 2개가 동시에 코드값 일치(`matched_keys` 우선배치) + 설명 문구까지 동일해 임베딩 유사도로도 우열 불가 |
+| `ambiguous` → 되묻기 → `confirmed` | `settle_method_cd` | 후보 3개 중 2개가 동시에 코드값 일치(`matched_keys` 우선배치) + 설명 문구까지 동일해 임베딩 유사도로도 우열 불가 — `request_clarification`이 실제로 되묻는 걸 보여주는 대표 시연 케이스 |
 | `no_match` | `updt_dt` / `biz_reg_no` | 매핑정의서에 해당 TO-BE 컬럼 자체가 없음 |
 | `version_mismatch` | `reg_dt` | 매핑정의서가 가리키는 AS-IS 컬럼이 스키마 개편으로 사라짐 |
 | `insufficient_metadata` | `div_wht_amt` | 후보의 데이터 타입 정보 자체가 없어 필수조건 판정 불가 |
@@ -129,6 +130,7 @@ schemabridge/
 │   ├── llm_client.py        Azure OpenAI 공용 클라이언트 (Structured Output / 임베딩)
 │   ├── evidence.py          Node: infer_secondary_evidence
 │   ├── judge.py             Node: judge_and_rank
+│   ├── clarification.py     Node: request_clarification (질문 생성 + 답변 반영 재점수화)
 │   └── graph.py             LangGraph 조립 + 엔트리포인트
 ├── tests/                   결정적 파이프라인 검증 스크립트
 └── app.py                   Streamlit 시연용 뷰어

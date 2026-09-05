@@ -3,23 +3,25 @@ LangGraph 그래프 조립 지점 (엔트리포인트).
 
 4주차 설계상의 전체 그래프 중, 지금까지 구현된 노드
 (lookup_mapping_candidates -> filter_by_type -> check_code_match ->
-infer_secondary_evidence -> judge_and_rank)를 연결한다.
+infer_secondary_evidence -> judge_and_rank -> request_clarification)를 연결한다.
 
-- classify_intent, SC-002 체인(search_schema 이하)은 아직 아무 구현도 없으므로 포함하지 않았다.
+- classify_intent, generate_rationale, SC-002 체인(search_schema 이하)은
+  아직 구현되지 않아 포함하지 않았다.
 - infer_secondary_evidence(LLM 임베딩 유사도 / 자체추론)가 매긴 evidence_scores를
   judge_and_rank가 받아 confidence_gap(1위-2위 점수차) 기준으로 confirmed/ambiguous/
   insufficient_metadata를 최종 판정한다(임계값은 src/judge.py 참고, 4주차 설계 v5의
   "초기값, PoC 진행하며 튜닝 예정" 잠정치).
-- confirmed면 format_response로, 그 외(ambiguous/insufficient_metadata)면
-  "await_clarification"에서 판정 결과(ranked_result, confidence_gap)를 노출한 채 멈춘다 —
-  request_clarification(사람에게 되묻는 루프, 최대 2회)이 아직 없어서다.
-  generate_rationale도 아직 없다.
+- confirmed가 아니면 request_clarification이 실제로 되묻고(터미널 input()) 답을 받아
+  점수를 재산정한 뒤 judge_and_rank로 되돌아간다(루프, 최대 MAX_ATTEMPTS=2회).
+  그래도 confirmed가 안 나오면 handle_exception이 최종 ambiguous/insufficient_metadata로
+  종료한다. request_clarification의 실제 시연은 이 CLI가 아니라 app.py(Streamlit,
+  st.session_state 기반)에서 한다 — input()은 웹 서버 안에서 답을 받을 방법이 없어서다.
 - 즉 이 그래프가 낼 수 있는 결론은 confirmed / no_match / version_mismatch /
-  insufficient_metadata / ambiguous 다섯 가지이며, ambiguous/insufficient_metadata는
-  아직 사람에게 되묻지 못하고 판정 결과만 노출한 채 끝난다.
+  insufficient_metadata / ambiguous 다섯 가지다.
 
 실행하려면 langgraph, openai, python-dotenv 패키지가 필요하고,
-infer_secondary_evidence 실행 시 schemabridge/.env에 Azure OpenAI 설정이 있어야 한다.
+infer_secondary_evidence/request_clarification 실행 시 schemabridge/.env에
+Azure OpenAI 설정이 있어야 한다.
 """
 
 import json
@@ -31,6 +33,7 @@ from langgraph.graph import END, START, StateGraph
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from src.clarification import MAX_ATTEMPTS, build_clarification_question, rescore_with_clarification
 from src.code_match import check_code_match
 from src.evidence import infer_secondary_evidence
 from src.filters import filter_by_type
@@ -52,6 +55,8 @@ class AgentState(TypedDict, total=False):
     ranked_result: list[dict]
     judged_winner: dict | None
     judged_status: str | None
+    clarification_attempts: int
+    clarification_answers: list[str]
     route: str  # 각 노드가 다음 목적지(노드 이름)를 직접 써넣는 내부 신호
     exception_status: str | None
     final_answer: dict
@@ -103,7 +108,12 @@ def infer_secondary_evidence_node(state: AgentState) -> dict:
 
 def judge_and_rank_node(state: AgentState) -> dict:
     result = judge_and_rank(state["evidence_scores"], state["code_match_results"])
-    route = "format_response" if result["status"] == "confirmed" else "await_clarification"
+    if result["status"] == "confirmed":
+        route = "format_response"
+    elif state.get("clarification_attempts", 0) >= MAX_ATTEMPTS:
+        route = "handle_exception"
+    else:
+        route = "request_clarification"
     return {
         "confidence_gap": result["confidence_gap"],
         "ranked_result": result["ranked_result"],
@@ -124,6 +134,21 @@ def handle_exception_node(state: AgentState) -> dict:
         )
     elif not state.get("filtered_candidates"):
         status, reason = "no_match", "타입 필수조건을 통과하는 후보가 하나도 없음(타입 충돌)"
+    elif state.get("judged_status") in ("ambiguous", "insufficient_metadata"):
+        # judge_and_rank가 MAX_ATTEMPTS번 되물어도 confirmed를 못 낸 최종 종료 경로.
+        status = state["judged_status"]
+        attempts = state.get("clarification_attempts", 0)
+        reason = f"{attempts}회 되물어도 확정하지 못함 — 사람의 최종 판단 필요"
+        return {
+            "exception_status": status,
+            "final_answer": {
+                "to_be_column": state["to_be_column"],
+                "status": status,
+                "reason": reason,
+                "ranked_result": state.get("ranked_result", []),
+                "clarification_answers": state.get("clarification_answers", []),
+            },
+        }
     else:
         unknown = state.get("unknown_type") or []
         cols = [f"{c['candidate']['table']}.{c['candidate']['column']}" for c in unknown]
@@ -162,21 +187,21 @@ def format_response_node(state: AgentState) -> dict:
     }
 
 
-def await_clarification_node(state: AgentState) -> dict:
-    # request_clarification이 아직 없어서, judge_and_rank가 내린 ambiguous/
-    # insufficient_metadata 판정을 사람에게 되묻지 않고 그대로 노출만 한다.
-    # request_clarification 구현 시 이 노드는 되물음 루프(최대 2회)로 대체된다.
-    status = state.get("judged_status") or "pending_llm"
+def request_clarification_node(state: AgentState) -> dict:
+    # 터미널 CLI용 최소 구현. 실제 시연(Streamlit)은 app.py가 st.session_state로
+    # 같은 build_clarification_question/rescore_with_clarification을 재사용해 별도로 구현한다 —
+    # input()은 웹 서버(app.py) 안에서 답을 받을 방법이 없어서 CLI 전용으로 남겨둠.
+    question = build_clarification_question(state["to_be_column"], state["ranked_result"])
+    answer = input(f"\n[request_clarification] {question}\n> ")
+
+    updated_scores = rescore_with_clarification(state["to_be_column"], state["ranked_result"], answer)
+    attempts = state.get("clarification_attempts", 0) + 1
+    answers = state.get("clarification_answers", []) + [answer]
+
     return {
-        "exception_status": status,
-        "final_answer": {
-            "to_be_column": state["to_be_column"],
-            "status": status,
-            "confidence_gap": state.get("confidence_gap"),
-            "ranked_result": state.get("ranked_result", []),
-            "reason": "judge_and_rank까지 판정 완료. "
-            "request_clarification(되묻기) 구현 후 정보 보완 필요",
-        },
+        "evidence_scores": updated_scores,
+        "clarification_attempts": attempts,
+        "clarification_answers": answers,
     }
 
 
@@ -190,7 +215,7 @@ def build_graph():
     graph.add_node("format_response", format_response_node)
     graph.add_node("infer_secondary_evidence", infer_secondary_evidence_node)
     graph.add_node("judge_and_rank", judge_and_rank_node)
-    graph.add_node("await_clarification", await_clarification_node)
+    graph.add_node("request_clarification", request_clarification_node)
 
     graph.add_edge(START, "lookup_mapping_candidates")
     # 각 노드가 state["route"]에 실제 목적지 노드 이름을 써넣으므로, 그 값을 그대로 따라간다.
@@ -215,11 +240,15 @@ def build_graph():
     graph.add_conditional_edges(
         "judge_and_rank",
         lambda s: s["route"],
-        {"format_response": "format_response", "await_clarification": "await_clarification"},
+        {
+            "format_response": "format_response",
+            "request_clarification": "request_clarification",
+            "handle_exception": "handle_exception",
+        },
     )
+    graph.add_edge("request_clarification", "judge_and_rank")  # 답변 반영 후 재판정 루프
     graph.add_edge("handle_exception", END)
     graph.add_edge("format_response", END)
-    graph.add_edge("await_clarification", END)
 
     return graph.compile()
 

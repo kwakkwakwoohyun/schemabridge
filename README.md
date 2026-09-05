@@ -35,19 +35,21 @@ graph TD;
 	infer_secondary_evidence(infer_secondary_evidence)
 	judge_and_rank(judge_and_rank)
 	request_clarification(request_clarification)
+	generate_rationale(generate_rationale)
 	__end__([__end__]):::last
 	__start__ --> lookup_mapping_candidates;
 	lookup_mapping_candidates -.-> filter_by_type;
 	lookup_mapping_candidates -.-> handle_exception;
 	filter_by_type -.-> check_code_match;
 	filter_by_type -.-> handle_exception;
-	check_code_match -.-> format_response;
+	check_code_match -.-> generate_rationale;
 	check_code_match -.-> infer_secondary_evidence;
 	infer_secondary_evidence --> judge_and_rank;
-	judge_and_rank -.-> format_response;
+	judge_and_rank -.-> generate_rationale;
 	judge_and_rank -.-> request_clarification;
 	judge_and_rank -.-> handle_exception;
 	request_clarification --> judge_and_rank;
+	generate_rationale --> format_response;
 	format_response --> __end__;
 	handle_exception --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
@@ -55,7 +57,7 @@ graph TD;
 	classDef last fill:#bfb6fc
 ```
 
-LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서·코드 매핑정의서)는 벡터 검색이 아니라 정확 조회를 쓰고, 근거가 확실한 케이스는 결정적 로직만으로 바로 확정됩니다. 후보가 여러 개인데 결정적 로직으로 못 가리면 임베딩 유사도/LLM 자체추론(`infer_secondary_evidence`)으로 점수를 매기고, 그 점수차(`confidence_gap`)를 기준으로 `judge_and_rank`가 최종 confirmed/ambiguous/insufficient_metadata를 판정합니다. confirmed가 아니면 `request_clarification`이 실제로 사람에게 되묻고 답을 반영해 재점수화한 뒤 `judge_and_rank`로 되돌아갑니다(루프, 최대 2회) — 그래도 안 풀리면 `handle_exception`이 정직하게 종료합니다.
+LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서·코드 매핑정의서)는 벡터 검색이 아니라 정확 조회를 쓰고, 근거가 확실한 케이스는 결정적 로직만으로 바로 확정됩니다. 후보가 여러 개인데 결정적 로직으로 못 가리면 임베딩 유사도/LLM 자체추론(`infer_secondary_evidence`)으로 점수를 매기고, 그 점수차(`confidence_gap`)를 기준으로 `judge_and_rank`가 최종 confirmed/ambiguous/insufficient_metadata를 판정합니다. confirmed가 아니면 `request_clarification`이 실제로 사람에게 되묻고 답을 반영해 재점수화한 뒤 `judge_and_rank`로 되돌아갑니다(루프, 최대 2회) — 그래도 안 풀리면 `handle_exception`이 정직하게 종료합니다. confirmed로 확정되는 경로(단일 후보/코드값 일치/LLM 점수 확정 어느 쪽이든)는 전부 `generate_rationale`을 거쳐 `format_response`로 가는데, 여기서 `confidence_gap` 퍼센트 같은 내부 계산값 대신 사람이 읽기 좋은 근거 문장으로 바꿔서 최종 응답에 담습니다.
 
 | 구분 | 선택 | 이유 |
 | --- | --- | --- |
@@ -74,8 +76,8 @@ LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서�
 - [x] `judge_and_rank` — `confidence_gap` 기준 confirmed/ambiguous/insufficient_metadata 최종 판정
 - [x] 위 노드들을 LangGraph 그래프로 조립 (`src/graph.py`)
 - [x] `request_clarification` — 애매한 판정에 대해 사람에게 구체적으로 되묻는 루프(최대 2회, 답변 반영해 재점수화 후 재판정)
-- [x] Streamlit 데모 뷰어 (`app.py`) — `judge_and_rank`/`request_clarification`까지 반영해 실시간 판정·되묻기 UI 표시(`st.session_state` 기반)
-- [ ] `generate_rationale` — 내부 추론과 분리된 사용자 노출용 근거 문장 생성
+- [x] `generate_rationale` — confirmed 경로(단일 후보/코드값 일치/LLM 점수 확정/되묻기 후 확정) 공통으로 내부 계산값 대신 사람이 읽기 좋은 근거 문장 생성
+- [x] Streamlit 데모 뷰어 (`app.py`) — `judge_and_rank`/`request_clarification`/`generate_rationale`까지 반영해 실시간 판정·되묻기·최종 근거 UI 표시(`st.session_state` 기반)
 - [ ] `classify_intent`, SC-002(신고서용 집계 쿼리 생성) 전체 — SC-001 완료 후 착수 예정
 
 ### 골든셋 14건 — 시연 가능한 케이스
@@ -131,6 +133,7 @@ schemabridge/
 │   ├── evidence.py          Node: infer_secondary_evidence
 │   ├── judge.py             Node: judge_and_rank
 │   ├── clarification.py     Node: request_clarification (질문 생성 + 답변 반영 재점수화)
+│   ├── rationale.py         Node: generate_rationale (사용자 노출용 최종 근거 문장 생성)
 │   └── graph.py             LangGraph 조립 + 엔트리포인트
 ├── tests/                   결정적 파이프라인 검증 스크립트
 └── app.py                   Streamlit 시연용 뷰어

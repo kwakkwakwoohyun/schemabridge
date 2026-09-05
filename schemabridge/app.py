@@ -12,6 +12,12 @@ insufficient_metadata) request_clarification 로직(src/clarification.py)으로 
 되묻는다 — graph.py(CLI)와 달리 여기는 웹 서버라 input()을 못 쓰므로, st.text_input +
 st.session_state로 같은 재판정 루프를 구현한다(최대 MAX_ATTEMPTS회).
 
+confirmed로 확정되는 순간(단일 후보/코드값 일치/LLM 점수 확정/되묻기 후 확정 어느
+경로든) generate_rationale(src/rationale.py)을 호출해 confidence_gap 퍼센트 같은
+내부 계산값 대신 사람이 읽기 좋은 최종 근거 문장을 만든다. 화면에는 내부 판정
+과정(1차 판정, AS-IS 후보, 근거 스코어링 표)과 이 최종 근거를 모두 보여줘서,
+"내부 추론과 사용자 노출용 근거를 분리한다"는 설계 원칙을 실제로 보여준다.
+
 st.session_state["result"]를 유일한 상태 저장소로 써서, "답변 제출" 버튼 클릭으로
 스크립트가 처음부터 재실행되어도(Streamlit rerun 모델) 후보 목록·판정 결과가
 사라지지 않고 이어지게 한다.
@@ -27,6 +33,7 @@ from src.code_match import check_code_match
 from src.evidence import infer_secondary_evidence
 from src.judge import judge_and_rank
 from src.clarification import MAX_ATTEMPTS, build_clarification_question, rescore_with_clarification
+from src.rationale import generate_rationale
 
 
 def preliminary_status(lookup_result, filter_result, code_results):
@@ -97,9 +104,13 @@ def render_result(result: dict) -> None:
 
     clar = result.get("clarification")
     if clar is None:
+        if "confirmed" in status:
+            st.subheader("최종 판정 근거")
+            winner = result["winner"]
+            st.success(f"CONFIRMED — {winner['table']}.{winner['column']}\n\n{result['final_rationale']}")
         return
 
-    st.subheader("근거 스코어링 & 최종 판정")
+    st.subheader("근거 스코어링 & 최종 판정 (내부 상태)")
     st.caption(f"1위·2위 점수차(confidence_gap): {clar['confidence_gap']:.0%} (확정 임계값: 10%)")
     st.table([
         {
@@ -114,11 +125,8 @@ def render_result(result: dict) -> None:
 
     if clar["status"] == "confirmed":
         winner = clar["winner"]
-        st.success(
-            f"CONFIRMED — {winner['table']}.{winner['column']} "
-            f"(점수 {winner['score']}, 근거 출처: {winner['evidence_source']})\n\n"
-            f"{winner['rationale']}"
-        )
+        st.subheader("최종 판정 근거")
+        st.success(f"CONFIRMED — {winner['table']}.{winner['column']}\n\n{clar['final_rationale']}")
         return
 
     if clar["attempts"] >= MAX_ATTEMPTS:
@@ -148,7 +156,14 @@ def render_result(result: dict) -> None:
         clar["confidence_gap"] = rejudged["confidence_gap"]
         clar["attempts"] += 1
         clar["answers"].append(answer)
-        if clar["status"] != "confirmed" and clar["attempts"] < MAX_ATTEMPTS:
+        if clar["status"] == "confirmed":
+            with st.spinner("근거 문장 생성 중 (Azure OpenAI 호출)..."):
+                clar["final_rationale"] = generate_rationale(
+                    result["to_be_column"], clar["winner"], ranked_result=clar["ranked_result"],
+                    clarification_answers=clar["answers"],
+                )
+            clar["question"] = None
+        elif clar["attempts"] < MAX_ATTEMPTS:
             with st.spinner("다음 질문 생성 중..."):
                 clar["question"] = build_clarification_question(result["to_be_column"], clar["ranked_result"])
         else:
@@ -206,11 +221,27 @@ if st.button("매핑 후보 조회", type="primary") and to_be_column:
                 "attempts": 0,
                 "answers": [],
                 "question": None,
+                "final_rationale": None,
             }
-            if judged["status"] != "confirmed":
+            if judged["status"] == "confirmed":
+                with st.spinner("근거 문장 생성 중 (Azure OpenAI 호출)..."):
+                    clarification["final_rationale"] = generate_rationale(
+                        to_be_column, judged["winner"], ranked_result=judged["ranked_result"]
+                    )
+            else:
                 with st.spinner("되물을 질문 생성 중 (Azure OpenAI 호출)..."):
                     clarification["question"] = build_clarification_question(to_be_column, judged["ranked_result"])
             result["clarification"] = clarification
+        elif "confirmed" in status:
+            # 결정적 로직(단일 후보 / 코드값 일치)만으로 이미 확정된 경우.
+            if len(filter_result["filtered"]) == 1:
+                winner = filter_result["filtered"][0]
+            else:
+                matched_keys = {(r["table"], r["column"]) for r in code_results if r["matched"]}
+                winner = next(c for c in filter_result["filtered"] if (c["table"], c["column"]) in matched_keys)
+            with st.spinner("근거 문장 생성 중 (Azure OpenAI 호출)..."):
+                result["final_rationale"] = generate_rationale(to_be_column, winner)
+            result["winner"] = winner
 
         st.session_state.result = result
 

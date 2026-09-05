@@ -3,10 +3,10 @@ LangGraph 그래프 조립 지점 (엔트리포인트).
 
 4주차 설계상의 전체 그래프 중, 지금까지 구현된 노드
 (lookup_mapping_candidates -> filter_by_type -> check_code_match ->
-infer_secondary_evidence -> judge_and_rank -> request_clarification)를 연결한다.
+infer_secondary_evidence -> judge_and_rank -> request_clarification ->
+generate_rationale -> format_response)를 연결한다.
 
-- classify_intent, generate_rationale, SC-002 체인(search_schema 이하)은
-  아직 구현되지 않아 포함하지 않았다.
+- classify_intent, SC-002 체인(search_schema 이하)은 아직 구현되지 않아 포함하지 않았다.
 - infer_secondary_evidence(LLM 임베딩 유사도 / 자체추론)가 매긴 evidence_scores를
   judge_and_rank가 받아 confidence_gap(1위-2위 점수차) 기준으로 confirmed/ambiguous/
   insufficient_metadata를 최종 판정한다(임계값은 src/judge.py 참고, 4주차 설계 v5의
@@ -16,12 +16,16 @@ infer_secondary_evidence -> judge_and_rank -> request_clarification)를 연결�
   그래도 confirmed가 안 나오면 handle_exception이 최종 ambiguous/insufficient_metadata로
   종료한다. request_clarification의 실제 시연은 이 CLI가 아니라 app.py(Streamlit,
   st.session_state 기반)에서 한다 — input()은 웹 서버 안에서 답을 받을 방법이 없어서다.
+- confirmed 경로(단일 후보 / 코드값 일치 / LLM 점수 확정, 세 갈래 전부)는 format_response로
+  바로 가지 않고 generate_rationale을 먼저 거친다. confidence_gap 퍼센트나 matched_keys
+  같은 내부 계산값을 그대로 노출하는 대신, LLM이 사람이 읽기 좋은 근거 문장으로 바꿔서
+  반환한다(4주차 설계 "내부 추론과 사용자 노출용 근거 분리" 원칙, src/rationale.py 참고).
 - 즉 이 그래프가 낼 수 있는 결론은 confirmed / no_match / version_mismatch /
   insufficient_metadata / ambiguous 다섯 가지다.
 
 실행하려면 langgraph, openai, python-dotenv 패키지가 필요하고,
-infer_secondary_evidence/request_clarification 실행 시 schemabridge/.env에
-Azure OpenAI 설정이 있어야 한다.
+infer_secondary_evidence/request_clarification/generate_rationale 실행 시
+schemabridge/.env에 Azure OpenAI 설정이 있어야 한다.
 """
 
 import json
@@ -39,6 +43,7 @@ from src.evidence import infer_secondary_evidence
 from src.filters import filter_by_type
 from src.judge import judge_and_rank
 from src.lookup import lookup_mapping_candidates
+from src.rationale import generate_rationale
 
 
 class AgentState(TypedDict, total=False):
@@ -57,6 +62,7 @@ class AgentState(TypedDict, total=False):
     judged_status: str | None
     clarification_attempts: int
     clarification_answers: list[str]
+    rationale: str
     route: str  # 각 노드가 다음 목적지(노드 이름)를 직접 써넣는 내부 신호
     exception_status: str | None
     final_answer: dict
@@ -95,7 +101,7 @@ def code_match_node(state: AgentState) -> dict:
     results = check_code_match(state["filtered_candidates"])
     matched = [r for r in results if r["matched"]]
     if len(state["filtered_candidates"]) == 1 or len(matched) == 1:
-        route = "format_response"
+        route = "generate_rationale"
     else:
         route = "infer_secondary_evidence"
     return {"code_match_results": results, "route": route}
@@ -109,7 +115,7 @@ def infer_secondary_evidence_node(state: AgentState) -> dict:
 def judge_and_rank_node(state: AgentState) -> dict:
     result = judge_and_rank(state["evidence_scores"], state["code_match_results"])
     if result["status"] == "confirmed":
-        route = "format_response"
+        route = "generate_rationale"
     elif state.get("clarification_attempts", 0) >= MAX_ATTEMPTS:
         route = "handle_exception"
     else:
@@ -160,21 +166,33 @@ def handle_exception_node(state: AgentState) -> dict:
     }
 
 
-def format_response_node(state: AgentState) -> dict:
+def generate_rationale_node(state: AgentState) -> dict:
+    # format_response 이전 단계에서 confirmed 경로 3가지(단일 후보/코드값 일치/LLM 점수 확정)의
+    # winner를 여기서 한 번에 판정하고, 내부 계산값(confidence_gap 퍼센트, matched_keys 등)을
+    # 그대로 노출하는 대신 LLM으로 사람이 읽기 좋은 근거 문장을 생성한다.
     filtered = state["filtered_candidates"]
     judged_winner = state.get("judged_winner")
+    ranked_result = None
     if judged_winner:
         winner = judged_winner
-        gap = state.get("confidence_gap", 0)
-        reason = f"보조 근거(임베딩 유사도/자체추론) 판정 결과 1위·2위 점수차가 {gap:.0%}로 임계값 이상이라 확정"
+        ranked_result = state.get("ranked_result")
     elif len(filtered) == 1:
         winner = filtered[0]
-        reason = "매핑정의서상 후보가 1개뿐이라 확정"
     else:
         matched_keys = {(r["table"], r["column"]) for r in state["code_match_results"] if r["matched"]}
         winner = next(c for c in filtered if (c["table"], c["column"]) in matched_keys)
-        reason = "코드 매핑정의서상 코드값이 일치하는 유일한 후보라 강한 근거로 확정"
 
+    rationale = generate_rationale(
+        to_be_column=state["to_be_column"],
+        winner=winner,
+        ranked_result=ranked_result,
+        clarification_answers=state.get("clarification_answers"),
+    )
+    return {"judged_winner": winner, "rationale": rationale}
+
+
+def format_response_node(state: AgentState) -> dict:
+    winner = state["judged_winner"]
     return {
         "exception_status": None,
         "final_answer": {
@@ -182,7 +200,7 @@ def format_response_node(state: AgentState) -> dict:
             "status": "confirmed",
             "table": winner["table"],
             "column": winner["column"],
-            "reason": reason,
+            "reason": state["rationale"],
         },
     }
 
@@ -216,6 +234,7 @@ def build_graph():
     graph.add_node("infer_secondary_evidence", infer_secondary_evidence_node)
     graph.add_node("judge_and_rank", judge_and_rank_node)
     graph.add_node("request_clarification", request_clarification_node)
+    graph.add_node("generate_rationale", generate_rationale_node)
 
     graph.add_edge(START, "lookup_mapping_candidates")
     # 각 노드가 state["route"]에 실제 목적지 노드 이름을 써넣으므로, 그 값을 그대로 따라간다.
@@ -234,19 +253,20 @@ def build_graph():
     graph.add_conditional_edges(
         "check_code_match",
         lambda s: s["route"],
-        {"format_response": "format_response", "infer_secondary_evidence": "infer_secondary_evidence"},
+        {"generate_rationale": "generate_rationale", "infer_secondary_evidence": "infer_secondary_evidence"},
     )
     graph.add_edge("infer_secondary_evidence", "judge_and_rank")
     graph.add_conditional_edges(
         "judge_and_rank",
         lambda s: s["route"],
         {
-            "format_response": "format_response",
+            "generate_rationale": "generate_rationale",
             "request_clarification": "request_clarification",
             "handle_exception": "handle_exception",
         },
     )
     graph.add_edge("request_clarification", "judge_and_rank")  # 답변 반영 후 재판정 루프
+    graph.add_edge("generate_rationale", "format_response")
     graph.add_edge("handle_exception", END)
     graph.add_edge("format_response", END)
 

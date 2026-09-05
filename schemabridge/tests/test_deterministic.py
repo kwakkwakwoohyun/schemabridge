@@ -1,6 +1,7 @@
 """
 결정적 로직 3종(lookup_mapping_candidates -> filter_by_type -> check_code_match)을
-골든셋 12건에 대해 실제로 실행하고, 여기까지만으로 판정 가능한 케이스는 맞는지 검증한다.
+골든셋 전체(data/golden_set.json)에 대해 실제로 실행하고, 여기까지만으로 판정 가능한
+케이스는 맞는지 검증한다.
 
 judge_and_rank/infer_secondary_evidence는 다음 태스크(LLM)에서 구현하므로,
 여기서는 "여기까지의 파이프라인 출력이 기대한 모양인지"만 확인한다.

@@ -13,7 +13,9 @@
         "updt_dt": {"type": "DATE", "description": "수정일자"},
         "biz_reg_no": {"type": "TEXT", "description": "사업자등록번호"},
         "div_wht_amt": {"type": "NUMERIC", "description": "배당소득 원천징수세액"},
-        "div_payee_nm": {"type": "TEXT", "description": "배당 지급처명"}
+        "div_payee_nm": {"type": "TEXT", "description": "배당 지급처명"},
+        "wht_reason_cd": {"type": "TEXT", "description": "원천징수 사유 코드", "fk": "COM_CODE"},
+        "settle_method_cd": {"type": "TEXT", "description": "정산 방법 코드", "fk": "COM_CODE"}
       }
     }
   },
@@ -26,7 +28,9 @@
         "pay_amt": {"type": "NUMERIC", "description": "지급 급여액"},
         "wht_amt": {"type": "NUMERIC", "description": "원천징수세액"},
         "tax_rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["R01", "R02"]},
-        "std_rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["S01", "S02"]}
+        "std_rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["S01", "S02"]},
+        "wht_reason_cd": {"type": "TEXT", "description": "원천징수 사유 코드", "fk": "COM_CODE", "sample_data": ["W01", "W02"]},
+        "settle_method_cd": {"type": "TEXT", "description": "정산 방법 코드", "fk": "COM_CODE", "sample_data": ["M01", "M02"]}
       }
     },
     "INT_WHT": {
@@ -36,7 +40,9 @@
         "acct_nm": {"type": "TEXT", "description": null, "sample_data": ["최지우", "정하윤"]},
         "pay_amt": {"type": "NUMERIC", "description": null, "sample_data": [1500000, 820000]},
         "wht_amt": {"type": "NUMERIC", "description": "원천세액"},
-        "rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["R01"]}
+        "rate_cd": {"type": "TEXT", "description": null, "fk": "COM_CODE", "sample_data": ["R01"]},
+        "wht_reason_cd": {"type": "TEXT", "description": "원천징수 사유 코드", "fk": "COM_CODE", "sample_data": ["W01"]},
+        "settle_method_cd": {"type": "TEXT", "description": "정산 방법 코드", "fk": "COM_CODE", "sample_data": ["M01", "M02"]}
       }
     },
     "DIV_WHT": {
@@ -46,7 +52,8 @@
         "acct_nm": {"type": "TEXT", "description": null, "sample_data": ["강시우", "윤예준"]},
         "acct_no": {"type": "TEXT", "description": null, "sample_data": ["110-234-5678"]},
         "pay_amt": {"type": "NUMERIC", "description": null, "sample_data": [300000, 450000]},
-        "wht_amt": {"type": null, "description": null, "sample_data": [46200, 69300]}
+        "wht_amt": {"type": null, "description": null, "sample_data": [46200, 69300]},
+        "pay_type_cd": {"type": "TEXT", "description": "지급 유형 코드", "fk": "COM_CODE", "sample_data": ["P01"]}
       }
     },
     "ETC_INCOME": {

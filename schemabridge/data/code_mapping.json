@@ -1,5 +1,8 @@
 {
   "entries": [
-    {"table": "BIZ_INCOME", "column": "income_cd", "note": "TO-BE income_type_cd 공통코드와 매핑 확인됨(INCOME_TYPE 코드그룹)"}
+    {"table": "BIZ_INCOME", "column": "income_cd", "note": "TO-BE income_type_cd 공통코드와 매핑 확인됨(INCOME_TYPE 코드그룹)"},
+    {"table": "LBR_WHT", "column": "wht_reason_cd", "note": "TO-BE wht_reason_cd 공통코드와 매핑 확인됨(WHT_REASON 코드그룹)"},
+    {"table": "LBR_WHT", "column": "settle_method_cd", "note": "TO-BE settle_method_cd 공통코드와 매핑 확인됨(SETTLE_METHOD 코드그룹) — 레거시 이관 과정에서 동일 코드그룹이 두 시스템에 중복 도입됨"},
+    {"table": "INT_WHT", "column": "settle_method_cd", "note": "TO-BE settle_method_cd 공통코드와 매핑 확인됨(SETTLE_METHOD 코드그룹) — 위와 동일 사유"}
   ]
 }

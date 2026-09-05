@@ -29,6 +29,16 @@
 
     {"to_be_column": "ACC_WHT_AGG.reg_dt", "candidates": [
       {"table": "LBR_WHT", "column": "input_dt"}
+    ]},
+
+    {"to_be_column": "ACC_WHT_AGG.wht_reason_cd", "candidates": [
+      {"table": "LBR_WHT", "column": "wht_reason_cd"},
+      {"table": "INT_WHT", "column": "wht_reason_cd"}
+    ]},
+    {"to_be_column": "ACC_WHT_AGG.settle_method_cd", "candidates": [
+      {"table": "LBR_WHT", "column": "settle_method_cd"},
+      {"table": "INT_WHT", "column": "settle_method_cd"},
+      {"table": "DIV_WHT", "column": "pay_type_cd"}
     ]}
   ]
 }

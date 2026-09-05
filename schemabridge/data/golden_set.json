@@ -14,5 +14,8 @@
   {"to_be_column": "ACC_WHT_AGG.updt_dt", "expected_status": "no_match", "note": "매핑정의서에 해당 컬럼 자체가 없음"},
   {"to_be_column": "ACC_WHT_AGG.biz_reg_no", "expected_status": "no_match", "note": "매핑정의서에 해당 컬럼 자체가 없음"},
 
-  {"to_be_column": "ACC_WHT_AGG.reg_dt", "expected_status": "version_mismatch", "note": "매핑정의서가 가리키는 LBR_WHT.input_dt가 현재 AS-IS 스키마에 없음(스키마 변경으로 컬럼명이 바뀌었거나 삭제됨)"}
+  {"to_be_column": "ACC_WHT_AGG.reg_dt", "expected_status": "version_mismatch", "note": "매핑정의서가 가리키는 LBR_WHT.input_dt가 현재 AS-IS 스키마에 없음(스키마 변경으로 컬럼명이 바뀌었거나 삭제됨)"},
+
+  {"to_be_column": "ACC_WHT_AGG.wht_reason_cd", "expected_status": "confirmed", "note": "후보 2개 중 코드값 매핑정의서 일치가 정확히 1개(LBR_WHT) — format_response의 코드값 disambiguation(후보 2개 이상 중 확정) 경로 검증용 (2026-09-05 추가, 테스트 커버리지 갭 해소)"},
+  {"to_be_column": "ACC_WHT_AGG.settle_method_cd", "expected_status": "ambiguous", "note": "후보 3개 중 2개(LBR_WHT/INT_WHT)가 동시에 코드값 일치, 설명 문구도 완전히 동일해 임베딩 유사도로도 우열 불가 — judge_and_rank의 코드값 우선배치(matched_keys)와 ambiguous 판정 경로 검증용 (2026-09-05 추가, 테스트 커버리지 갭 해소)"}
 ]

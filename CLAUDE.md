@@ -42,14 +42,20 @@ git 저장소입니다. 원격: `https://github.com/kwakkwakwoohyun/schemabridge
 
 - **이미 구현·검증 완료 (그대로 재사용, 다시 만들지 말 것):**
     - `src/data_loader.py`, `src/lookup.py`(`lookup_mapping_candidates`), `src/filters.py`(`filter_by_type`), `src/code_match.py`(`check_code_match`) — 전부 결정적(deterministic) 로직이며 API 키 없이 동작함
-    - `data/schema.json`, `data/mapping_definition.json`, `data/code_mapping.json`, `data/golden_set.json` — 합성 데모 데이터(TO-BE `ACC_WHT_AGG` 테이블, AS-IS 원천징수 테이블들, 골든셋 12건)
-    - `tests/test_deterministic.py` — 골든셋 12건을 lookup→filter→code_match 순으로 실행해 검증 완료. 결과: confirmed 4건 정확, version_mismatch 1건 정확, no_match 2건 정확, insufficient_metadata(타입 정보 없음) 1건 조기 정확 판정, 나머지 6건(LLM 판단 필요한 케이스)은 의도대로 "PENDING → 다음 단계 필요"로 넘어감
-    - `app.py` — Streamlit 기반 **시연 영상용 뷰어**(제품 기능 아님, 2주차 범위정의상 "비개발자용 UI"는 Out of Scope로 명시했으므로 이것과 혼동하지 말 것). TO-BE 컬럼명을 직접 타이핑해서 입력하면 `lookup → filter → code_match`를 그대로 호출해 후보·판정 상태를 표로 보여줌. LLM 판정이 필요한 케이스는 결과를 지어내지 않고 "PENDING" 표시. `streamlit run app.py`로 실행. 5개 대표 케이스(confirmed/ambiguous→PENDING/no_match/version_mismatch/insufficient_metadata)로 로직 검증 완료
-- **아직 구현 안 됨 (다음 작업 대상):**
-    - LLM 판정 노드 4종 — `infer_secondary_evidence`의 LLM 추론 부분, `judge_and_rank`, `request_clarification`, `generate_rationale`. 이 부분은 Azure OpenAI 키가 있어야 실제 실행·검증이 가능함
-    - LangGraph 그래프 조립(노드/엣지 연결, state 정의) 자체도 아직 코드로 만들어지지 않음
+    - `src/llm_client.py` — Azure OpenAI 공용 클라이언트 래퍼(`chat_completion_json` Structured Output, `embed`). LLM이 필요한 노드는 전부 이 모듈을 통해서만 호출함
+    - `src/evidence.py`(`infer_secondary_evidence`) — 결정적 로직으로 못 가린 후보에 임베딩 유사도/LLM 자체추론으로 점수를 매김. `_get_confirmed_mappings`로 골든셋이 아니라 파이프라인이 스스로 확정한 결과만 few-shot 힌트로 재사용(순환검증 방지)
+    - `src/judge.py`(`judge_and_rank`) — `evidence_scores`로 confirmed/ambiguous/insufficient_metadata 최종 판정(`confidence_gap` 임계값 10%, top1 최소 확신도 0.5 — 둘 다 초기값, PoC 진행하며 튜닝 예정)
+    - `src/graph.py` — LangGraph `StateGraph` 조립 완료. 노드: `lookup_mapping_candidates → filter_by_type → check_code_match → infer_secondary_evidence → judge_and_rank → format_response`(confirmed) / `handle_exception`(no_match·version_mismatch·insufficient_metadata) / `await_clarification`(ambiguous·insufficient_metadata, 판정 결과만 노출하고 멈추는 자리표시자)
+    - `data/schema.json`, `data/mapping_definition.json`, `data/code_mapping.json`, `data/golden_set.json` — 합성 데모 데이터(TO-BE `ACC_WHT_AGG` 테이블, AS-IS 원천징수 테이블들). 골든셋은 **14건**: 원래 12건(사람이 검증한 SC-001 완료 기준 정답지, 고정 — 절대 수정하지 말 것) + 2026-09-05에 테스트 커버리지 갭 해소용으로 추가한 2건(`wht_reason_cd`: 코드값 disambiguation 경로 검증용, `settle_method_cd`: `judge_and_rank`의 matched_keys 우선배치·ambiguous 판정 경로 검증용). 새 2건도 기존 12건과 같은 원칙(사람이 의도를 갖고 설계한 시나리오, 시스템 자기산출 결과 아님)으로 추가됨
+    - `tests/test_deterministic.py` — 골든셋 전체를 lookup→filter→code_match 순으로 실행해 검증. 결정적으로 끝까지 판정 가능한 케이스(confirmed 5건, version_mismatch 1건, no_match 2건, insufficient_metadata 1건)는 실제 상태와 일치, 나머지(LLM 판단 필요한 케이스)는 의도대로 "PENDING → 다음 단계 필요"로 넘어감
+    - `python3 src/graph.py`(전체 그래프, Azure OpenAI 키 필요) 실행 시 골든셋 14건 전부 의도한 범주로 판정됨을 확인함(no_match 2건, version_mismatch 1건, insufficient_metadata 1건은 호출마다 항상 동일 — 나머지는 confirmed 또는 ambiguous). 단, `payee_biz_no`는 LLM 자체추론 점수가 임계값 근처(0.5~0.6대)라 호출마다 `confirmed`/`ambiguous`가 갈릴 수 있음(비결정적 LLM 호출 특성 — 버그 아님). `settle_method_cd`는 두 후보 설명 문구를 의도적으로 완전히 동일하게 설계해서 항상 `ambiguous`로 재현됨
+    - `app.py` — Streamlit 기반 **시연 영상용 뷰어**(제품 기능 아님, 2주차 범위정의상 "비개발자용 UI"는 Out of Scope로 명시했으므로 이것과 혼동하지 말 것). TO-BE 컬럼명을 입력하면 결정적 로직 → (필요시) `infer_secondary_evidence` → `judge_and_rank`까지 그대로 호출해 최종 상태(confirmed/ambiguous/insufficient_metadata 등)를 실시간으로 보여줌. `streamlit run app.py`로 실행
+- **아직 구현 안 됨 (다음 작업 대상, 우선순위순):**
+    - `request_clarification` — `judge_and_rank`가 ambiguous/insufficient_metadata로 판정했을 때 사람에게 구체적으로 되묻는 루프(최대 2회 재시도). 지금은 `await_clarification_node`가 판정 결과만 노출하고 멈춤
+    - `generate_rationale` — confirmed 결과에 내부 추론과 분리된 사용자 노출용 근거 문장 생성
+    - `classify_intent`, SC-002 체인(`search_schema` 이하) — SC-001 완료 후 착수 예정, 아직 손 안 댐
     - `data/setup_demo_data.py`, `src/cli.py`, `tests/run_eval.py` 같은 실행 엔트리포인트도 아직 없음 (4주차 설계 문서상의 계획일 뿐, 실제 파일 아님)
-- 이미 구현된 결정적 로직에 손대야 할 이유가 생기면, 먼저 사용자에게 확인하고 진행할 것 — 이미 여러 차례 검증을 거친 코드임.
+- 이미 구현된 결정적 로직/기존 골든셋 12건에 손대야 할 이유가 생기면, 먼저 사용자에게 확인하고 진행할 것 — 이미 여러 차례 검증을 거친 코드임.
 
 ## `schemabridge/` 실행 및 테스트
 
@@ -58,7 +64,7 @@ git 저장소입니다. 원격: `https://github.com/kwakkwakwoohyun/schemabridge
   ```
   cd schemabridge && python3 tests/test_deterministic.py
   ```
-  pytest 기반이 아니라 골든셋 12건을 돌려 표로 출력하는 스크립트이므로, 개별 케이스만 보려면 파일 하단의 `["ACC_WHT_AGG.income_type_cd", ...]` 목록을 수정하거나 `main()`을 직접 호출해 특정 컬럼만 확인하세요.
+  pytest 기반이 아니라 골든셋 14건을 돌려 표로 출력하는 스크립트이므로, 개별 케이스만 보려면 파일 하단의 `["ACC_WHT_AGG.income_type_cd", ...]` 목록을 수정하거나 `main()`을 직접 호출해 특정 컬럼만 확인하세요.
 - **중요 — Python 버전 주의:** `src/data_loader.py`가 `dict | None` (PEP 604) 반환 타입 문법을 쓰기 때문에 **Python 3.10 이상**이 필요합니다. 이 머신의 기본 `python3`는 `/usr/bin/python3` (3.9.6)이며, 이 버전으로 실행하면 모듈 임포트 시점에 `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`로 즉시 실패합니다. 이 머신에는 3.10+가 별도로 설치되어 있지 않으므로(`pyenv`, Homebrew python 모두 없음), 실행을 요청받으면 먼저 3.10+ 인터프리터 확보 방법(pyenv 설치, Homebrew `python@3.11` 등)을 사용자와 확인하세요 — 임의로 `dict | None`을 `Optional[dict]`로 바꾸는 등 코드를 낮은 버전에 맞춰 되돌리지 마세요(4주차 설계 문서 기준 Python 3.11+가 명시적 전제입니다).
 
 ## 이 저장소에서 작업할 때

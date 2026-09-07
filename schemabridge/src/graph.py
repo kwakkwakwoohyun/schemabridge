@@ -1,12 +1,25 @@
 """
 LangGraph 그래프 조립 지점 (엔트리포인트).
 
-4주차 설계상의 전체 그래프 중, 지금까지 구현된 노드
-(lookup_mapping_candidates -> filter_by_type -> check_code_match ->
-infer_secondary_evidence -> judge_and_rank -> request_clarification ->
-generate_rationale -> format_response)를 연결한다.
+4주차 설계상의 전체 그래프(SC-001 + SC-002 확장 체인)를 전부 연결한다.
 
-- classify_intent, SC-002 체인(search_schema 이하)은 아직 구현되지 않아 포함하지 않았다.
+- classify_intent가 그래프의 첫 진입점이다. 입력이 "TABLE.column" 단일 식별자면
+  SC-001(컬럼 매핑 조회), 자연어 문장(예: "이번 분기 원천세 신고서용 집계 데이터
+  뽑아줘")이면 SC-002(신고서용 집계 쿼리 생성)로 분류해 갈라진다(src/intent.py).
+- SC-001 체인(lookup_mapping_candidates -> filter_by_type -> check_code_match ->
+  infer_secondary_evidence -> judge_and_rank -> request_clarification ->
+  generate_rationale -> format_response)은 이전과 동일하다.
+- SC-002 체인: search_schema(src/schema_search.py, 조인 규칙 정확 조회) 이후
+  classify_intent가 매긴 sc002_mode로 갈라진다. mode="explore"(테이블/컬럼
+  정보만 원하는 탐색 요청, 2026-09-07 추가 — src/intent.py docstring 참고)면
+  format_schema_response로 바로 가서 search_schema가 검증해 둔 테이블/컬럼
+  정보만 최종 답변으로 보여주고 끝난다(쿼리 생성·실행 없음). mode="execute"
+  (실제 집계 결과를 원하는 요청, 기본값)면 기존처럼 generate_sql(src/sql_generation.py,
+  LLM) -> validate_readonly(src/sql_validation.py, 결정적) -> (통과)
+  execute_sql(src/sql_executor.py, SQLite 실제 실행) -> (성공) format_report_response /
+  (실패, 재시도<3) generate_sql로 되돌아가는 self_correct 루프 / (실패, 재시도>=3
+  또는 validate_readonly 위반 또는 리포트 정의 없음) handle_exception까지 간다.
+  self_correct는 별도 노드가 아니라 이 재시도 루프 자체다.
 - infer_secondary_evidence(LLM 임베딩 유사도 / 자체추론)가 매긴 evidence_scores를
   judge_and_rank가 받아 confidence_gap(1위-2위 점수차) 기준으로 confirmed/ambiguous/
   insufficient_metadata를 최종 판정한다(임계값은 src/judge.py 참고, 4주차 설계 v5의
@@ -20,12 +33,16 @@ generate_rationale -> format_response)를 연결한다.
   바로 가지 않고 generate_rationale을 먼저 거친다. confidence_gap 퍼센트나 matched_keys
   같은 내부 계산값을 그대로 노출하는 대신, LLM이 사람이 읽기 좋은 근거 문장으로 바꿔서
   반환한다(4주차 설계 "내부 추론과 사용자 노출용 근거 분리" 원칙, src/rationale.py 참고).
-- 즉 이 그래프가 낼 수 있는 결론은 confirmed / no_match / version_mismatch /
-  insufficient_metadata / ambiguous 다섯 가지다.
+- SC-001이 낼 수 있는 결론은 confirmed / no_match / version_mismatch /
+  insufficient_metadata / ambiguous. SC-002가 낼 수 있는 결론은 schema_found(mode=explore
+  성공, format_schema_response) / report_ready(mode=execute 성공, format_report_response) /
+  mapping_not_ready(리포트 정의 없음) / readonly_violation(쓰기 쿼리 시도) /
+  sql_execution_failed(3회 재시도 소진) — 뒤 3개는 전부 handle_exception이 정직하게 종료한다.
 
 실행하려면 langgraph, openai, python-dotenv 패키지가 필요하고,
-infer_secondary_evidence/request_clarification/generate_rationale 실행 시
-schemabridge/.env에 Azure OpenAI 설정이 있어야 한다.
+LLM이 필요한 노드 실행 시 schemabridge/.env에 Azure OpenAI 설정이 있어야 한다.
+SC-002는 추가로 data/setup_demo_db.py가 만드는 SQLite(data/demo.db, 최초 실행 시
+자동 생성)가 필요하다.
 """
 
 import json
@@ -41,12 +58,18 @@ from src.clarification import MAX_ATTEMPTS, build_clarification_question, rescor
 from src.code_match import check_code_match
 from src.evidence import infer_secondary_evidence
 from src.filters import filter_by_type
+from src.intent import classify_intent
 from src.judge import judge_and_rank
 from src.lookup import lookup_mapping_candidates
 from src.rationale import generate_rationale
+from src.schema_search import search_schema
+from src.sql_executor import MAX_SQL_ATTEMPTS, execute_sql
+from src.sql_generation import generate_sql
+from src.sql_validation import validate_readonly
 
 
 class AgentState(TypedDict, total=False):
+    user_request: str
     to_be_column: str
     candidates: list[dict]
     source_version: str | None
@@ -63,9 +86,25 @@ class AgentState(TypedDict, total=False):
     clarification_attempts: int
     clarification_answers: list[str]
     rationale: str
+    # --- SC-002 ---
+    sc002_mode: str | None  # "explore"(테이블 정보만) or "execute"(쿼리 생성·실행까지)
+    join_rule: dict | None
+    schema_chunks: list[str]
+    sql: str
+    sql_attempts: int
+    sql_error: str | None
+    query_result: dict | None
+    validation_error: str | None
     route: str  # 각 노드가 다음 목적지(노드 이름)를 직접 써넣는 내부 신호
     exception_status: str | None
     final_answer: dict
+
+
+def classify_intent_node(state: AgentState) -> dict:
+    result = classify_intent(state["user_request"])
+    if result["intent"] == "SC-001":
+        return {"to_be_column": result["to_be_column"], "route": "lookup_mapping_candidates"}
+    return {"sc002_mode": result["sc002_mode"], "route": "search_schema"}
 
 
 def lookup_node(state: AgentState) -> dict:
@@ -130,6 +169,42 @@ def judge_and_rank_node(state: AgentState) -> dict:
 
 
 def handle_exception_node(state: AgentState) -> dict:
+    sc002_status = state.get("exception_status")
+    if sc002_status == "mapping_not_ready":
+        reason = state.get("validation_error") or (
+            "이 요청에 대응하는 사전 정의된 리포트/조인 규칙(data/join_rules.json)이 "
+            "없음 — SC-001에서 매핑을 먼저 확정하고 리포트 정의를 등록해야 함"
+        )
+        return {
+            "exception_status": sc002_status,
+            "final_answer": {
+                "user_request": state["user_request"],
+                "status": sc002_status,
+                "reason": reason,
+            },
+        }
+    if sc002_status == "readonly_violation":
+        return {
+            "exception_status": sc002_status,
+            "final_answer": {
+                "user_request": state["user_request"],
+                "status": sc002_status,
+                "reason": f"생성된 SQL이 Read-only 검증을 통과하지 못함: {state.get('sql_error')}",
+                "sql": state.get("sql"),
+            },
+        }
+    if sc002_status == "sql_execution_failed":
+        return {
+            "exception_status": sc002_status,
+            "final_answer": {
+                "user_request": state["user_request"],
+                "status": sc002_status,
+                "reason": f"{state.get('sql_attempts', 0)}회 재시도해도 SQL 실행 실패 — "
+                f"마지막 에러: {state.get('sql_error')}",
+                "sql": state.get("sql"),
+            },
+        }
+
     if state.get("status_hint") in ("no_match", "version_mismatch"):
         status = state["status_hint"]
         reason = (
@@ -223,6 +298,88 @@ def request_clarification_node(state: AgentState) -> dict:
     }
 
 
+def search_schema_node(state: AgentState) -> dict:
+    result = search_schema()
+    if not result["found"]:
+        return {
+            "exception_status": "mapping_not_ready",
+            "validation_error": result.get("validation_error"),
+            "route": "handle_exception",
+        }
+    route = "format_schema_response" if state.get("sc002_mode") == "explore" else "generate_sql"
+    return {"schema_chunks": result["schema_chunks"], "join_rule": result["join_rule"], "route": route}
+
+
+def format_schema_response_node(state: AgentState) -> dict:
+    # sc002_mode == "explore": 실제 쿼리를 만들거나 실행하지 않고, search_schema가
+    # 이미 검증해 둔 테이블/컬럼 정보만 보여준다(src/intent.py docstring 참고).
+    join_rule = state["join_rule"]
+    sources = [
+        {
+            "to_be_table": s["to_be_table"],
+            "income_type_label": s["income_type_label"],
+            "column_map": s["column_map"],
+        }
+        for s in join_rule["sources"]
+    ]
+    return {
+        "exception_status": None,
+        "final_answer": {
+            "user_request": state["user_request"],
+            "status": "schema_found",
+            "report_name": join_rule["report_name"],
+            "report_columns": [c["field"] for c in join_rule["report_columns"]],
+            "sources": sources,
+        },
+    }
+
+
+def generate_sql_node(state: AgentState) -> dict:
+    result = generate_sql(state["schema_chunks"], state["user_request"], state.get("sql_error"))
+    return {"sql": result["sql"], "route": "validate_readonly"}
+
+
+def validate_readonly_node(state: AgentState) -> dict:
+    result = validate_readonly(state["sql"])
+    if result["is_valid"]:
+        return {"route": "execute_sql"}
+    return {"exception_status": "readonly_violation", "sql_error": result["reason"], "route": "handle_exception"}
+
+
+def execute_sql_node(state: AgentState) -> dict:
+    result = execute_sql(state["sql"])
+    attempts = state.get("sql_attempts", 0) + 1
+
+    if result["error"] is None:
+        return {"query_result": result, "sql_attempts": attempts, "route": "format_report_response"}
+
+    if attempts < MAX_SQL_ATTEMPTS:
+        route = "generate_sql"  # self_correct: 에러를 반영해 generate_sql로 되돌아가는 재시도 루프
+        return {"sql_error": result["error"], "sql_attempts": attempts, "route": route}
+
+    return {
+        "sql_error": result["error"],
+        "sql_attempts": attempts,
+        "exception_status": "sql_execution_failed",
+        "route": "handle_exception",
+    }
+
+
+def format_report_response_node(state: AgentState) -> dict:
+    result = state["query_result"]
+    return {
+        "exception_status": None,
+        "final_answer": {
+            "user_request": state["user_request"],
+            "status": "report_ready",
+            "report_name": state["join_rule"]["report_name"],
+            "sql": state["sql"],
+            "columns": result["columns"],
+            "rows": result["rows"],
+        },
+    }
+
+
 def build_graph():
     graph = StateGraph(AgentState)
 
@@ -235,8 +392,20 @@ def build_graph():
     graph.add_node("judge_and_rank", judge_and_rank_node)
     graph.add_node("request_clarification", request_clarification_node)
     graph.add_node("generate_rationale", generate_rationale_node)
+    graph.add_node("classify_intent", classify_intent_node)
+    graph.add_node("search_schema", search_schema_node)
+    graph.add_node("generate_sql", generate_sql_node)
+    graph.add_node("validate_readonly", validate_readonly_node)
+    graph.add_node("execute_sql", execute_sql_node)
+    graph.add_node("format_report_response", format_report_response_node)
+    graph.add_node("format_schema_response", format_schema_response_node)
 
-    graph.add_edge(START, "lookup_mapping_candidates")
+    graph.add_edge(START, "classify_intent")
+    graph.add_conditional_edges(
+        "classify_intent",
+        lambda s: s["route"],
+        {"lookup_mapping_candidates": "lookup_mapping_candidates", "search_schema": "search_schema"},
+    )
     # 각 노드가 state["route"]에 실제 목적지 노드 이름을 써넣으므로, 그 값을 그대로 따라간다.
     # path_map을 명시해야 print_ascii()/draw_mermaid() 같은 정적 시각화 도구가
     # 실행해보지 않고도 분기 가능한 노드를 전부 알 수 있다.
@@ -267,8 +436,34 @@ def build_graph():
     )
     graph.add_edge("request_clarification", "judge_and_rank")  # 답변 반영 후 재판정 루프
     graph.add_edge("generate_rationale", "format_response")
+    graph.add_conditional_edges(
+        "search_schema",
+        lambda s: s["route"],
+        {
+            "generate_sql": "generate_sql",
+            "format_schema_response": "format_schema_response",
+            "handle_exception": "handle_exception",
+        },
+    )
+    graph.add_edge("generate_sql", "validate_readonly")
+    graph.add_conditional_edges(
+        "validate_readonly",
+        lambda s: s["route"],
+        {"execute_sql": "execute_sql", "handle_exception": "handle_exception"},
+    )
+    graph.add_conditional_edges(
+        "execute_sql",
+        lambda s: s["route"],
+        {
+            "format_report_response": "format_report_response",
+            "generate_sql": "generate_sql",  # self_correct: 에러 반영해 재생성하는 루프
+            "handle_exception": "handle_exception",
+        },
+    )
     graph.add_edge("handle_exception", END)
     graph.add_edge("format_response", END)
+    graph.add_edge("format_report_response", END)
+    graph.add_edge("format_schema_response", END)
 
     return graph.compile()
 
@@ -277,14 +472,14 @@ def main() -> None:
     app = build_graph()
 
     if len(sys.argv) > 1:
-        columns = sys.argv[1:]
+        requests = sys.argv[1:]
     else:
         golden_path = os.path.join(os.path.dirname(__file__), "..", "data", "golden_set.json")
         with open(golden_path, encoding="utf-8") as f:
-            columns = [c["to_be_column"] for c in json.load(f)]
+            requests = [c["to_be_column"] for c in json.load(f)]
 
-    for col in columns:
-        result = app.invoke({"to_be_column": col})
+    for req in requests:
+        result = app.invoke({"user_request": req})
         print(json.dumps(result["final_answer"], ensure_ascii=False, indent=2))
 
 

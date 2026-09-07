@@ -1,0 +1,52 @@
+{
+  "reports": [
+    {
+      "report_id": "wht_report_div_etc_biz_income",
+      "report_name": "원천세 신고서 (배당·기타·사업소득)",
+      "note": "SC-002 Vertical Slice 범위. 3주차_완료.md SC-002 시나리오상 '사전 정의된 조인 규칙 + 고정된 신고서 양식'에 해당하는 정적 설정 — SC-001의 범용 mapping_definition.json과는 별개로, 이 리포트 전용으로 이미 확정된 규칙만 담는다. 2026-09-07 재설계: SC-002는 더 이상 AS-IS 원천 테이블을 쿼리 시점에 UNION하지 않는다 — '차세대 마이그레이션이 끝나 TO-BE 테이블에 데이터가 이미 채워져 있다'는 그림으로 바뀌어, 이제 sources는 전부 TO-BE 테이블이다. 실무에서 소득유형별로 TO-BE 테이블이 따로 관리되는 경우가 있어(예: 배당소득은 기존 ACC_WHT_AGG에 반영, 기타/사업소득은 이 리포트를 위해 새로 추가한 ACC_ETC_INCOME_AGG/ACC_BIZ_INCOME_AGG에 반영), 이 셋을 UNION ALL로 묶어 하나의 신고서 데이터로 만든다. 2026-09-07 추가: report_columns에 pay_dt(지급일자)를 추가해 신고서가 항상 특정 기간(분기/연도) 단위라는 실무 특성을 반영 — 이전엔 WHERE절 자체가 나올 수 없는 구조였는데, 사용자가 지적해서 기간 필터링이 가능하도록 확장함(src/sql_generation.py 참고).",
+      "report_columns": [
+        {"field": "pay_dt", "label": "지급일자"},
+        {"field": "payee_nm", "label": "지급처명"},
+        {"field": "income_type_cd", "label": "소득구분"},
+        {"field": "pay_amt", "label": "소득금액"},
+        {"field": "wht_tax_amt", "label": "원천징수세액"}
+      ],
+      "sources": [
+        {
+          "to_be_table": "ACC_WHT_AGG",
+          "income_type_label": "배당소득",
+          "column_map": {
+            "pay_dt": "pay_dt",
+            "payee_nm": "payee_nm",
+            "income_type_cd": "income_type_cd",
+            "pay_amt": "pay_amt",
+            "wht_tax_amt": "wht_tax_amt"
+          }
+        },
+        {
+          "to_be_table": "ACC_ETC_INCOME_AGG",
+          "income_type_label": "기타소득",
+          "column_map": {
+            "pay_dt": "pay_dt",
+            "payee_nm": "payee_nm",
+            "income_type_cd": "income_type_cd",
+            "pay_amt": "pay_amt",
+            "wht_tax_amt": "wht_tax_amt"
+          }
+        },
+        {
+          "to_be_table": "ACC_BIZ_INCOME_AGG",
+          "income_type_label": "사업소득",
+          "column_map": {
+            "pay_dt": "pay_dt",
+            "payee_nm": "payee_nm",
+            "income_type_cd": "income_type_cd",
+            "pay_amt": "pay_amt",
+            "wht_tax_amt": "wht_tax_amt"
+          }
+        }
+      ],
+      "combine": "union_all"
+    }
+  ]
+}

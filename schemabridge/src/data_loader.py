@@ -21,6 +21,12 @@ def load_code_mapping() -> dict:
         return json.load(f)
 
 
+def load_join_rules() -> dict:
+    """SC-002 전용 '사전 정의된 조인 규칙 + 고정된 신고서 양식' 정적 설정(data/join_rules.json)."""
+    with open(os.path.join(DATA_DIR, "join_rules.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
 def get_column_info(schema: dict, side: str, table: str, column: str) -> dict | None:
     """side: 'TO-BE' or 'AS-IS'. 존재하지 않으면 None (버전 불일치 감지에 사용)."""
     table_info = schema.get(side, {}).get(table)

@@ -20,7 +20,7 @@
 | | 설명 |
 | --- | --- |
 | **SC-001** (메인) | TO-BE 컬럼을 입력하면 매핑정의서를 정확 조회(Exact Lookup)해 AS-IS 후보를 찾고, `타입 필터 → 코드값 일치 → 설명 유사도/자체추론` 순으로 근거를 쌓아 순위를 매깁니다. 확신도가 낮으면 사람에게 넘기기 전에 먼저 구체적으로 되묻습니다(최대 2회). |
-| **SC-002** (확장) | SC-001에서 확정된 매핑과 사전 정의된 조인 규칙으로, 범위가 제한된 TO-BE 집계 쿼리를 생성·검증·실행합니다(자유 형식 text-to-SQL이 아님). |
+| **SC-002** (확장) | SC-001에서 확정된 매핑과 사전 정의된 조인 규칙으로, 원천세 신고서(배당·기타·사업소득 Vertical Slice)용 집계 쿼리를 생성·Read-only 검증·실제 실행합니다(자유 형식 text-to-SQL이 아니라 고정된 리포트 하나). "테이블만 찾아줘" 같은 탐색 요청과 "뽑아줘/집계해줘" 같은 실행 요청을 구분해서(`sc002_mode`), 탐색이면 쿼리를 만들지 않고 관련 테이블 정보만 보여줍니다. 요청에 기간(분기/연도)이 있으면 지급일자 기준 WHERE 필터도 걸립니다. 실행 실패 시 에러를 반영해 자기수정(최대 3회). |
 
 ## 아키텍처
 
@@ -36,8 +36,17 @@ graph TD;
 	judge_and_rank(judge_and_rank)
 	request_clarification(request_clarification)
 	generate_rationale(generate_rationale)
+	classify_intent(classify_intent)
+	search_schema(search_schema)
+	generate_sql(generate_sql)
+	validate_readonly(validate_readonly)
+	execute_sql(execute_sql)
+	format_report_response(format_report_response)
+	format_schema_response(format_schema_response)
 	__end__([__end__]):::last
-	__start__ --> lookup_mapping_candidates;
+	__start__ --> classify_intent;
+	classify_intent -.-> lookup_mapping_candidates;
+	classify_intent -.-> search_schema;
 	lookup_mapping_candidates -.-> filter_by_type;
 	lookup_mapping_candidates -.-> handle_exception;
 	filter_by_type -.-> check_code_match;
@@ -50,14 +59,29 @@ graph TD;
 	judge_and_rank -.-> handle_exception;
 	request_clarification --> judge_and_rank;
 	generate_rationale --> format_response;
+	search_schema -.-> format_schema_response;
+	search_schema -.-> generate_sql;
+	search_schema -.-> handle_exception;
+	generate_sql --> validate_readonly;
+	validate_readonly -.-> execute_sql;
+	validate_readonly -.-> handle_exception;
+	execute_sql -.-> format_report_response;
+	execute_sql -.-> generate_sql;
+	execute_sql -.-> handle_exception;
 	format_response --> __end__;
+	format_report_response --> __end__;
+	format_schema_response --> __end__;
 	handle_exception --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
 ```
 
-LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서·코드 매핑정의서)는 벡터 검색이 아니라 정확 조회를 쓰고, 근거가 확실한 케이스는 결정적 로직만으로 바로 확정됩니다. 후보가 여러 개인데 결정적 로직으로 못 가리면 임베딩 유사도/LLM 자체추론(`infer_secondary_evidence`)으로 점수를 매기고, 그 점수차(`confidence_gap`)를 기준으로 `judge_and_rank`가 최종 confirmed/ambiguous/insufficient_metadata를 판정합니다. confirmed가 아니면 `request_clarification`이 실제로 사람에게 되묻고 답을 반영해 재점수화한 뒤 `judge_and_rank`로 되돌아갑니다(루프, 최대 2회) — 그래도 안 풀리면 `handle_exception`이 정직하게 종료합니다. confirmed로 확정되는 경로(단일 후보/코드값 일치/LLM 점수 확정 어느 쪽이든)는 전부 `generate_rationale`을 거쳐 `format_response`로 가는데, 여기서 `confidence_gap` 퍼센트 같은 내부 계산값 대신 사람이 읽기 좋은 근거 문장으로 바꿔서 최종 응답에 담습니다.
+LangGraph로 조립된 판단 체인입니다. `classify_intent`가 그래프의 첫 진입점으로, 입력의 형태(식별자 vs 문장)가 아니라 의미로 분류합니다 — 컬럼 하나의 매핑 근거를 묻는 요청이면(자연어 문장이어도) SC-001로, 여러 컬럼을 모은 집계·리포트 요청이면 SC-002로 갈라집니다.
+
+**SC-001**: 정형 데이터(매핑정의서·코드 매핑정의서)는 벡터 검색이 아니라 정확 조회를 쓰고, 근거가 확실한 케이스는 결정적 로직만으로 바로 확정됩니다. 후보가 여러 개인데 결정적 로직으로 못 가리면 임베딩 유사도/LLM 자체추론(`infer_secondary_evidence`)으로 점수를 매기고, 그 점수차(`confidence_gap`)를 기준으로 `judge_and_rank`가 최종 confirmed/ambiguous/insufficient_metadata를 판정합니다. confirmed가 아니면 `request_clarification`이 실제로 사람에게 되묻고 답을 반영해 재점수화한 뒤 `judge_and_rank`로 되돌아갑니다(루프, 최대 2회) — 그래도 안 풀리면 `handle_exception`이 정직하게 종료합니다. confirmed로 확정되는 경로는 전부 `generate_rationale`을 거쳐 `format_response`로 가는데, 여기서 `confidence_gap` 퍼센트 같은 내부 계산값 대신 사람이 읽기 좋은 근거 문장으로 바꿔서 최종 응답에 담습니다.
+
+**SC-002**: "차세대 마이그레이션이 끝나서 관련 TO-BE 테이블들에 실제 데이터가 이미 채워져 있다"는 그림으로, AS-IS 테이블을 쿼리 시점에 조인하지 않습니다. `search_schema`가 `data/join_rules.json`(사전 정의된 조인 규칙 + 고정된 신고서 양식 — 소스가 전부 TO-BE 테이블: 배당소득=`ACC_WHT_AGG`, 기타소득=`ACC_ETC_INCOME_AGG`, 사업소득=`ACC_BIZ_INCOME_AGG`)을 정확 조회하고, 각 소스 컬럼이 `schema.json`에 실제로 존재하고 타입이 맞는지 결정적 도구(`filter_by_type`)로 재검증합니다(하나라도 어긋나면 리포트 전체를 `mapping_not_ready`로 차단). `classify_intent`가 매긴 `sc002_mode`로 여기서 갈라지는데, "explore"(예: "관련 테이블 다 찾아줘")면 검증된 테이블/컬럼 정보만 바로 응답하고 끝나고(`format_schema_response`), "execute"(예: "뽑아줘")면 `generate_sql`이 사용자 요청에 맞는 소스 테이블만 골라(2개 이상이면 `UNION ALL`) SELECT 전용 SQL을 생성합니다 — 요청에 기간이 언급되면 지급일자(`pay_dt`) 기준 WHERE 조건도 추가합니다. `validate_readonly`가 쓰기 쿼리를 결정적으로 차단하고, 통과한 SQL만 `execute_sql`이 실제 SQLite(`data/demo.db`)에 실행합니다. 실행이 실패하면 에러를 반영해 `generate_sql`로 되돌아가는 self_correct 루프(최대 3회) 후에도 안 풀리면 `handle_exception`이 종료합니다.
 
 | 구분 | 선택 | 이유 |
 | --- | --- | --- |
@@ -77,8 +101,9 @@ LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서�
 - [x] 위 노드들을 LangGraph 그래프로 조립 (`src/graph.py`)
 - [x] `request_clarification` — 애매한 판정에 대해 사람에게 구체적으로 되묻는 루프(최대 2회, 답변 반영해 재점수화 후 재판정)
 - [x] `generate_rationale` — confirmed 경로(단일 후보/코드값 일치/LLM 점수 확정/되묻기 후 확정) 공통으로 내부 계산값 대신 사람이 읽기 좋은 근거 문장 생성
-- [x] Streamlit 데모 뷰어 (`app.py`) — `judge_and_rank`/`request_clarification`/`generate_rationale`까지 반영해 실시간 판정·되묻기·최종 근거 UI 표시(`st.session_state` 기반)
-- [ ] `classify_intent`, SC-002(신고서용 집계 쿼리 생성) 전체 — SC-001 완료 후 착수 예정
+- [x] Streamlit 데모 뷰어 (`app.py`) — 입력 하나로 SC-001/SC-002를 모두 받음(`classify_intent`로 먼저 분류). SC-001은 `judge_and_rank`/`request_clarification`/`generate_rationale`까지 반영해 실시간 판정·되묻기·최종 근거 UI 표시(`st.session_state` 기반), SC-002는 `search_schema` 이후 `sc002_mode`로 갈라져 explore면 테이블 정보만, execute면 `generate_sql`→`validate_readonly`→`execute_sql`(self_correct 재시도 포함)까지 버튼 클릭 한 번 안에서 실행해 생성 SQL+실행 결과 표 또는 예외 메시지를 표시
+- [x] `classify_intent` — 컬럼 하나의 매핑 질문(SC-001, 자연어 문장이어도)인지 여러 컬럼을 모은 신고서 요청(SC-002)인지 의미 기준으로 LLM 분류. SC-002면 탐색(`explore`)/실행(`execute`) 의도까지 함께 분류
+- [x] SC-002(신고서용 집계 쿼리 생성) — `search_schema`(TO-BE 3개 소스 테이블 정확 조회 + 구조 검증) → (`explore`) `format_schema_response`로 바로 종료 / (`execute`) `generate_sql`(LLM, 기간 WHERE 필터 포함) → `validate_readonly`(결정적, Read-only 검증) → `execute_sql`(실제 SQLite 실행, 실패 시 최대 3회 self_correct) → `format_report_response`. 배당·기타·사업소득 리포트 1건 Vertical Slice로 범위 한정
 
 ### 골든셋 14건 — 시연 가능한 케이스
 
@@ -98,6 +123,23 @@ LangGraph로 조립된 판단 체인입니다. 정형 데이터(매핑정의서�
 
 원래 골든셋 12건(사람이 검증한 SC-001 완료 기준 정답지, 고정)에 더해, `wht_reason_cd`/`settle_method_cd` 2건은 테스트 커버리지 갭(후보 2개+ 중 코드값 disambiguation, `judge_and_rank`의 매치 우선배치·ambiguous 분기)을 검증하기 위해 추가한 케이스입니다. `payee_biz_no`처럼 LLM 판정 점수가 임계값 근처인 케이스는 호출마다 `confirmed`/`ambiguous`가 갈릴 수 있습니다(비결정적 LLM 호출 특성).
 
+### SC-002 데모 — 원천세 신고서(배당·기타·사업소득) 집계
+
+```bash
+# execute (기간 미지정 — 전체 조회, 36행)
+.venv/bin/python src/graph.py "원천세(배당·기타·사업소득) 신고서용 전체 집계 데이터 뽑아줘"
+
+# execute (기간 필터 — 데모 데이터는 2025년 4분기~2026년 2분기까지 있음)
+.venv/bin/python src/graph.py "2026년 1분기 원천세 신고서용 집계 데이터 뽑아줘"
+
+# explore (쿼리 생성/실행 없이 관련 테이블 정보만)
+.venv/bin/python src/graph.py "원천세 집계 관련된 테이블 다 찾아줘"
+
+# 또는 streamlit run app.py 실행 후 같은 문장을 입력창에 입력
+```
+
+TO-BE 테이블 `ACC_WHT_AGG`(배당소득)·`ACC_ETC_INCOME_AGG`(기타소득)·`ACC_BIZ_INCOME_AGG`(사업소득) — 셋 다 "이미 마이그레이션이 끝나 데이터가 채워져 있다"고 가정한 테이블입니다. 사용자 요청에 맞는 소스만 골라(특정 소득유형만 요청하면 그 테이블만, 아니면 전체를 `UNION ALL`) 지급일자/지급처명/소득구분/소득금액/원천징수세액 5개 고정 항목을 뽑는 SQL을 생성·검증·실행하고, 실제 SQLite 결과(테이블당 12건, 2025 Q4~2026 Q2에 걸쳐 분산 — 총 36건)를 그대로 반환합니다. 요청에 기간이 언급되면 지급일자 기준 WHERE 필터도 함께 걸립니다. `data/demo.db`가 없으면 최초 실행 시 자동으로 만들어집니다. CLI(`graph.py`)와 브라우저 데모(`app.py`) 양쪽에서 동일하게 동작합니다.
+
 ## 빠른 시작
 
 ```bash
@@ -107,23 +149,31 @@ python3.11 -m venv .venv
 
 # 결정적 파이프라인만 (외부 패키지 불필요, API 키 없이 실행 가능)
 .venv/bin/python tests/test_deterministic.py
+SCHEMABRIDGE_SKIP_LLM_TESTS=1 .venv/bin/python tests/test_sc002.py
 
 # LangGraph 전체 실행 (Azure OpenAI 키 필요 — .env.example 참고해 .env 준비)
 .venv/bin/python -m src.graph
-.venv/bin/python -m src.graph ACC_WHT_AGG.wht_tax_amt   # 특정 컬럼만
+.venv/bin/python -m src.graph ACC_WHT_AGG.wht_tax_amt   # SC-001: 특정 컬럼만
+.venv/bin/python -m src.graph "2026년 1분기 원천세 신고서용 집계 데이터 뽑아줘"   # SC-002: execute
+.venv/bin/python -m src.graph "원천세 집계 관련된 테이블 다 찾아줘"   # SC-002: explore
 
-# 브라우저 데모
+# 브라우저 데모 (SC-001/SC-002 모두 지원, 입력 하나로 classify_intent가 분류)
 .venv/bin/streamlit run app.py
+
+# 브라우저 데모 자동 검증 (AppTest, Azure OpenAI 키 필요)
+.venv/bin/python tests/test_app_streamlit.py
 ```
 
 > **Python 3.10+ 필요** — 코드가 `dict | None` 같은 최신 타입 문법을 씁니다.
-> LLM/임베딩이 필요한 노드(`infer_secondary_evidence`, `judge_and_rank`)를 쓰려면 `schemabridge/.env`에 Azure OpenAI 자격 정보가 있어야 합니다(`.env.example` 참고).
+> LLM/임베딩이 필요한 노드(`infer_secondary_evidence`, `judge_and_rank`, `classify_intent`, `generate_sql` 등)를 쓰려면 `schemabridge/.env`에 Azure OpenAI 자격 정보가 있어야 합니다(`.env.example` 참고).
 
 ## 프로젝트 구조
 
 ```
 schemabridge/
-├── data/                    합성 데모 데이터 (스키마·매핑정의서·코드매핑·골든셋 14건)
+├── data/                    합성 데모 데이터 (스키마·매핑정의서·코드매핑·골든셋 14건·SC-002 조인 규칙)
+│   ├── join_rules.json      SC-002 전용: 사전 정의된 조인 규칙 + 고정된 신고서 양식 (소스는 전부 TO-BE 테이블)
+│   └── setup_demo_db.py     SC-002용 SQLite(demo.db) 시딩 스크립트 — TO-BE 3개 테이블에 "이미 마이그레이션된" 데이터를 채움 (최초 실행 시 자동 생성, gitignore)
 ├── src/
 │   ├── data_loader.py       JSON 로더
 │   ├── lookup.py            Node: lookup_mapping_candidates
@@ -134,9 +184,14 @@ schemabridge/
 │   ├── judge.py             Node: judge_and_rank
 │   ├── clarification.py     Node: request_clarification (질문 생성 + 답변 반영 재점수화)
 │   ├── rationale.py         Node: generate_rationale (사용자 노출용 최종 근거 문장 생성)
+│   ├── intent.py            Node: classify_intent (SC-001/SC-002 분류, LLM)
+│   ├── schema_search.py     Node: search_schema (SC-002, 조인 규칙 정확 조회)
+│   ├── sql_generation.py    Node: generate_sql (SC-002, LLM)
+│   ├── sql_validation.py    Node: validate_readonly (SC-002, 결정적)
+│   ├── sql_executor.py      Node: execute_sql (SC-002, 실제 SQLite 실행)
 │   └── graph.py             LangGraph 조립 + 엔트리포인트
-├── tests/                   결정적 파이프라인 검증 스크립트
-└── app.py                   Streamlit 시연용 뷰어
+├── tests/                   결정적 파이프라인 + SC-002 + Streamlit 데모 검증 스크립트
+└── app.py                   Streamlit 시연용 뷰어 (SC-001/SC-002 모두 지원, classify_intent로 분류)
 ```
 
 ---

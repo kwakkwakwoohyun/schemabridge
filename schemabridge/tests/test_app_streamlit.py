@@ -87,6 +87,21 @@ def test_sc001_clarification_loop() -> bool:
     return ok
 
 
+def test_sc001_reverse_lookup() -> bool:
+    print("\n=== SC-001: 역방향(AS-IS → TO-BE) 자연어 질문 (LLM, Azure OpenAI 키 필요, 2026-09-08 추가) ===")
+    at = AppTest.from_file(os.path.join(_app_dir(), "app.py"))
+    at.run(timeout=60)
+    at.text_input[0].input("LBR_WHT.wht_amt가 TO-BE 어디로 매핑돼?")
+    at.button[0].click().run(timeout=60)
+    ok = True
+    ok &= check("예외 없음", not at.exception, str(at.exception))
+    ok &= check(
+        "CONFIRMED 렌더링됨(역방향 결과)",
+        any("CONFIRMED" in s.value and "ACC_WHT_AGG.wht_tax_amt" in s.value for s in at.success),
+    )
+    return ok
+
+
 def test_sc002_report_ready() -> bool:
     print("\n=== SC-002: 정상 리포트 생성 (LLM, Azure OpenAI 키 필요) ===")
     at = AppTest.from_file(os.path.join(_app_dir(), "app.py"))
@@ -110,7 +125,7 @@ def test_sc002_exceptions() -> bool:
     at.run(timeout=60)
     with mock.patch(
         "src.intent.classify_intent",
-        return_value={"intent": "SC-002", "to_be_column": None, "sc002_mode": "execute"},
+        return_value={"intent": "SC-002", "to_be_column": None, "as_is_column": None, "sc002_mode": "execute"},
     ), mock.patch(
         "src.schema_search.search_schema",
         return_value={"found": False, "schema_chunks": [], "join_rule": None, "validation_error": "테스트용 강제 실패"},
@@ -124,7 +139,7 @@ def test_sc002_exceptions() -> bool:
     at2.run(timeout=60)
     with mock.patch(
         "src.intent.classify_intent",
-        return_value={"intent": "SC-002", "to_be_column": None, "sc002_mode": "execute"},
+        return_value={"intent": "SC-002", "to_be_column": None, "as_is_column": None, "sc002_mode": "execute"},
     ), mock.patch(
         "src.schema_search.search_schema",
         return_value={"found": True, "schema_chunks": ["dummy"], "join_rule": {"report_name": "테스트 리포트"}, "validation_error": None},
@@ -140,7 +155,7 @@ def test_sc002_exceptions() -> bool:
     at3.run(timeout=60)
     with mock.patch(
         "src.intent.classify_intent",
-        return_value={"intent": "SC-002", "to_be_column": None, "sc002_mode": "execute"},
+        return_value={"intent": "SC-002", "to_be_column": None, "as_is_column": None, "sc002_mode": "execute"},
     ), mock.patch(
         "src.schema_search.search_schema",
         return_value={"found": True, "schema_chunks": ["dummy"], "join_rule": {"report_name": "테스트 리포트"}, "validation_error": None},
@@ -176,6 +191,7 @@ def main() -> None:
         test_sc001_identifier_input(),
         test_sc001_natural_language_question(),
         test_sc001_clarification_loop(),
+        test_sc001_reverse_lookup(),
         test_sc002_report_ready(),
         test_sc002_exceptions(),
         test_sc002_explore_mode(),

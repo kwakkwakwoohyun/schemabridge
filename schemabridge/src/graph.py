@@ -3,12 +3,22 @@ LangGraph 그래프 조립 지점 (엔트리포인트).
 
 4주차 설계상의 전체 그래프(SC-001 + SC-002 확장 체인)를 전부 연결한다.
 
-- classify_intent가 그래프의 첫 진입점이다. 입력이 "TABLE.column" 단일 식별자면
-  SC-001(컬럼 매핑 조회), 자연어 문장(예: "이번 분기 원천세 신고서용 집계 데이터
-  뽑아줘")이면 SC-002(신고서용 집계 쿼리 생성)로 분류해 갈라진다(src/intent.py).
-- SC-001 체인(lookup_mapping_candidates -> filter_by_type -> check_code_match ->
-  infer_secondary_evidence -> judge_and_rank -> request_clarification ->
-  generate_rationale -> format_response)은 이전과 동일하다.
+- classify_intent가 그래프의 첫 진입점이다. 입력의 형태(식별자 vs 자연어)가 아니라
+  의미로 SC-001(컬럼 매핑 조회)/SC-002(신고서용 집계 쿼리 생성)를 가른다(src/intent.py).
+- SC-001 정방향(TO-BE 컬럼이 주어짐) 체인(lookup_mapping_candidates -> filter_by_type ->
+  check_code_match -> infer_secondary_evidence -> judge_and_rank ->
+  request_clarification -> generate_rationale -> format_response)은 이전과 동일하다.
+- **2026-09-08 추가 — SC-001 역방향(AS-IS 컬럼이 주어짐)**: classify_intent가
+  as_is_column을 채우면 lookup_reverse_mapping(src/lookup.py, 매핑정의서 역인덱스
+  조회, 결정적)으로 간다. 정방향과 달리 후보 랭킹이 필요 없어(현재 데이터 기준 AS-IS
+  컬럼 하나가 둘 이상의 TO-BE 컬럼에 걸치는 경우 0건) filter_by_type 이하 판정
+  파이프라인을 타지 않고, matches가 정확히 1건이면 generate_reverse_rationale로 바로
+  가서 generate_rationale을 재사용해 근거 문장을 만든 뒤 format_response로 합류한다
+  (format_response의 "direction" 필드로 정방향/역방향을 구분해 노출). matches가 0건이면
+  reverse_no_match, 2건 이상이면 reverse_ambiguous로 handle_exception이 종료한다.
+  classify_intent가 TO-BE/AS-IS 어느 쪽인지조차 확신 못 하면(컬럼명이 양쪽에 겹치는
+  경우 등, src/intent.py 참고) to_be_column/as_is_column을 둘 다 null로 반환하고,
+  classify_intent_node가 이를 direction_ambiguous로 바로 handle_exception에 보낸다.
 - SC-002 체인: search_schema(src/schema_search.py, 조인 규칙 정확 조회) 이후
   classify_intent가 매긴 sc002_mode로 갈라진다. mode="explore"(테이블/컬럼
   정보만 원하는 탐색 요청, 2026-09-07 추가 — src/intent.py docstring 참고)면
@@ -34,7 +44,8 @@ LangGraph 그래프 조립 지점 (엔트리포인트).
   같은 내부 계산값을 그대로 노출하는 대신, LLM이 사람이 읽기 좋은 근거 문장으로 바꿔서
   반환한다(4주차 설계 "내부 추론과 사용자 노출용 근거 분리" 원칙, src/rationale.py 참고).
 - SC-001이 낼 수 있는 결론은 confirmed / no_match / version_mismatch /
-  insufficient_metadata / ambiguous. SC-002가 낼 수 있는 결론은 schema_found(mode=explore
+  insufficient_metadata / ambiguous / direction_ambiguous(방향 자체를 특정 못 함,
+  2026-09-08 추가). SC-002가 낼 수 있는 결론은 schema_found(mode=explore
   성공, format_schema_response) / report_ready(mode=execute 성공, format_report_response) /
   mapping_not_ready(리포트 정의 없음) / readonly_violation(쓰기 쿼리 시도) /
   sql_execution_failed(3회 재시도 소진) — 뒤 3개는 전부 handle_exception이 정직하게 종료한다.
@@ -60,7 +71,7 @@ from src.evidence import infer_secondary_evidence
 from src.filters import filter_by_type
 from src.intent import classify_intent
 from src.judge import judge_and_rank
-from src.lookup import lookup_mapping_candidates
+from src.lookup import lookup_mapping_candidates, lookup_reverse_mapping
 from src.rationale import generate_rationale
 from src.schema_search import search_schema
 from src.sql_executor import MAX_SQL_ATTEMPTS, execute_sql
@@ -71,6 +82,8 @@ from src.sql_validation import validate_readonly
 class AgentState(TypedDict, total=False):
     user_request: str
     to_be_column: str
+    as_is_column: str | None  # 역방향(AS-IS -> TO-BE) 조회 시에만 채워짐
+    reverse_matches: list[dict]
     candidates: list[dict]
     source_version: str | None
     status_hint: str | None
@@ -103,8 +116,47 @@ class AgentState(TypedDict, total=False):
 def classify_intent_node(state: AgentState) -> dict:
     result = classify_intent(state["user_request"])
     if result["intent"] == "SC-001":
-        return {"to_be_column": result["to_be_column"], "route": "lookup_mapping_candidates"}
+        if result["to_be_column"]:
+            return {
+                "to_be_column": result["to_be_column"],
+                "as_is_column": None,
+                "route": "lookup_mapping_candidates",
+            }
+        if result["as_is_column"]:
+            return {
+                "as_is_column": result["as_is_column"],
+                "to_be_column": None,
+                "route": "lookup_reverse_mapping",
+            }
+        # 방향(TO-BE→AS-IS / AS-IS→TO-BE)조차 확신할 수 없는 경우(src/intent.py 참고) —
+        # 억지로 추측하지 않고 사용자에게 다시 물어봐야 한다.
+        return {"exception_status": "direction_ambiguous", "route": "handle_exception"}
     return {"sc002_mode": result["sc002_mode"], "route": "search_schema"}
+
+
+def lookup_reverse_node(state: AgentState) -> dict:
+    as_is_table, as_is_col = state["as_is_column"].split(".", 1)
+    result = lookup_reverse_mapping(as_is_table, as_is_col)
+    if not result["matches"]:
+        return {"exception_status": "reverse_no_match", "route": "handle_exception"}
+    if len(result["matches"]) > 1:
+        return {
+            "reverse_matches": result["matches"],
+            "exception_status": "reverse_ambiguous",
+            "route": "handle_exception",
+        }
+    return {"to_be_column": result["matches"][0]["to_be_column"], "route": "generate_reverse_rationale"}
+
+
+def generate_reverse_rationale_node(state: AgentState) -> dict:
+    # 역방향은 후보 랭킹이 없어(lookup_reverse_mapping이 이미 단일 확정) filter_by_type
+    # 이하 판정 파이프라인을 태우지 않고, generate_rationale만 그대로 재사용해 바로
+    # 근거 문장을 만든다. generate_rationale은 "TO-BE X는 AS-IS Y로 매핑됐다"는 동일한
+    # 사실을 설명하므로 정방향/역방향 어느 쪽에서 호출해도 그대로 재사용 가능하다.
+    as_is_table, as_is_col = state["as_is_column"].split(".", 1)
+    winner = {"table": as_is_table, "column": as_is_col}
+    rationale = generate_rationale(to_be_column=state["to_be_column"], winner=winner)
+    return {"judged_winner": winner, "rationale": rationale}
 
 
 def lookup_node(state: AgentState) -> dict:
@@ -204,6 +256,39 @@ def handle_exception_node(state: AgentState) -> dict:
                 "sql": state.get("sql"),
             },
         }
+    if sc002_status == "direction_ambiguous":
+        return {
+            "exception_status": sc002_status,
+            "final_answer": {
+                "user_request": state["user_request"],
+                "status": sc002_status,
+                "reason": "입력이 TO-BE 컬럼을 묻는 건지 AS-IS 컬럼을 묻는 건지, 혹은 어느 "
+                "테이블을 말하는 건지 특정할 수 없습니다. 테이블명을 포함해서 다시 질문해 "
+                "주세요(예: 'LBR_WHT.settle_method_cd가 TO-BE 어디로 매핑돼?').",
+            },
+        }
+    if sc002_status == "reverse_no_match":
+        return {
+            "exception_status": sc002_status,
+            "final_answer": {
+                "as_is_column": state.get("as_is_column"),
+                "status": "no_match",
+                "reason": f"'{state.get('as_is_column')}'을(를) TO-BE 컬럼으로 매핑하는 항목이 "
+                "매핑정의서에 없거나, 이 AS-IS 컬럼 자체가 현재 스키마에 없습니다.",
+            },
+        }
+    if sc002_status == "reverse_ambiguous":
+        matches = state.get("reverse_matches", [])
+        return {
+            "exception_status": sc002_status,
+            "final_answer": {
+                "as_is_column": state.get("as_is_column"),
+                "status": "ambiguous",
+                "reason": "이 AS-IS 컬럼이 둘 이상의 TO-BE 컬럼에 매핑되어 있어 자동으로 하나를 "
+                "고를 수 없습니다.",
+                "candidates": [m["to_be_column"] for m in matches],
+            },
+        }
 
     if state.get("status_hint") in ("no_match", "version_mismatch"):
         status = state["status_hint"]
@@ -268,11 +353,13 @@ def generate_rationale_node(state: AgentState) -> dict:
 
 def format_response_node(state: AgentState) -> dict:
     winner = state["judged_winner"]
+    direction = "as_is_to_to_be" if state.get("as_is_column") else "to_be_to_as_is"
     return {
         "exception_status": None,
         "final_answer": {
             "to_be_column": state["to_be_column"],
             "status": "confirmed",
+            "direction": direction,
             "table": winner["table"],
             "column": winner["column"],
             "reason": state["rationale"],
@@ -384,6 +471,8 @@ def build_graph():
     graph = StateGraph(AgentState)
 
     graph.add_node("lookup_mapping_candidates", lookup_node)
+    graph.add_node("lookup_reverse_mapping", lookup_reverse_node)
+    graph.add_node("generate_reverse_rationale", generate_reverse_rationale_node)
     graph.add_node("filter_by_type", filter_node)
     graph.add_node("check_code_match", code_match_node)
     graph.add_node("handle_exception", handle_exception_node)
@@ -404,7 +493,12 @@ def build_graph():
     graph.add_conditional_edges(
         "classify_intent",
         lambda s: s["route"],
-        {"lookup_mapping_candidates": "lookup_mapping_candidates", "search_schema": "search_schema"},
+        {
+            "lookup_mapping_candidates": "lookup_mapping_candidates",
+            "lookup_reverse_mapping": "lookup_reverse_mapping",
+            "search_schema": "search_schema",
+            "handle_exception": "handle_exception",  # 방향(direction_ambiguous) 자체를 판별 못 한 경우
+        },
     )
     # 각 노드가 state["route"]에 실제 목적지 노드 이름을 써넣으므로, 그 값을 그대로 따라간다.
     # path_map을 명시해야 print_ascii()/draw_mermaid() 같은 정적 시각화 도구가
@@ -414,6 +508,12 @@ def build_graph():
         lambda s: s["route"],
         {"filter_by_type": "filter_by_type", "handle_exception": "handle_exception"},
     )
+    graph.add_conditional_edges(
+        "lookup_reverse_mapping",
+        lambda s: s["route"],
+        {"generate_reverse_rationale": "generate_reverse_rationale", "handle_exception": "handle_exception"},
+    )
+    graph.add_edge("generate_reverse_rationale", "format_response")
     graph.add_conditional_edges(
         "filter_by_type",
         lambda s: s["route"],

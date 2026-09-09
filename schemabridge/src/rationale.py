@@ -36,6 +36,7 @@ def generate_rationale(
     winner: dict,
     ranked_result: list[dict] | None = None,
     clarification_answers: list[str] | None = None,
+    discovered: bool = False,
 ) -> str:
     winner_line = f"{winner['table']}.{winner['column']}"
     ranked_lines = (
@@ -52,10 +53,18 @@ def generate_rationale(
         if clarification_answers
         else ""
     )
+    discovery_note = (
+        "\n\n주의: 이 매핑은 매핑정의서에 미리 등록되어 있던 게 아니라, 시스템이 반대편 "
+        "스키마 전체를 탐색해서 스스로 찾아낸 결과다. 사람이 사전에 검증한 매핑이 아니라는 "
+        "점을 근거 문장에 명확히 알려라(예: '매핑정의서에 등록되어 있지 않아 자동으로 "
+        "탐색해 찾은 결과이니 확정 전 검토가 필요합니다' 같은 취지)."
+        if discovered
+        else ""
+    )
 
     prompt = (
         f"TO-BE 컬럼 '{to_be_column}'은 AS-IS 컬럼 '{winner_line}'로 매핑이 확정됐다.\n"
-        f"판정 근거:\n{ranked_lines}{clarification_note}\n\n"
+        f"판정 근거:\n{ranked_lines}{clarification_note}{discovery_note}\n\n"
         "이 판정을 매핑정의서를 검토하는 개발자에게 보여줄 한두 문장짜리 근거 설명을 "
         "작성해라. 점수·퍼센트·임계값 같은 내부 계산값을 그대로 나열하지 말고, "
         "왜 이 AS-IS 컬럼이 업무적으로 맞는지를 자연스러운 문장으로 설명해라."

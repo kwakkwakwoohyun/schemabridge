@@ -11,6 +11,11 @@ check_code_match까지 통과했지만(강한 근거 없음) 후보가 여전히
 
 이 노드는 최종 판정을 내리지 않는다. 각 후보에 score/rationale을 붙여
 judge_and_rank로 넘기기 위한 근거 하나를 추가하는 역할만 한다.
+
+anchor_side(2026-09-09 추가, 기본값 "TO-BE" — 기존 호출부와 100% 동일하게 동작):
+후보 자동 탐색(src/discovery.py)의 역방향 탐색(AS-IS 컬럼 기준으로 TO-BE 전체를
+후보로 스코어링)만 "AS-IS"를 명시적으로 넘긴다. _get_confirmed_mappings 힌트는
+TO-BE 기준 매핑정의서를 재실행하는 로직이라 anchor_side="AS-IS"일 때는 사용하지 않는다.
 """
 
 import json
@@ -52,34 +57,40 @@ SELF_INFERENCE_SCHEMA = {
 }
 
 
-def infer_secondary_evidence(to_be_column: str, filtered_candidates: list[dict]) -> dict:
+def infer_secondary_evidence(anchor_column: str, filtered_candidates: list[dict], anchor_side: str = "TO-BE") -> dict:
+    """anchor_side(2026-09-09 추가, 기본값 "TO-BE" — 기존 호출부와 100% 동일하게 동작):
+    기준 컬럼이 TO-BE 쪽인지 AS-IS 쪽인지. 후보 자동 탐색(src/discovery.py)의 역방향
+    탐색만 "AS-IS"를 명시적으로 넘겨서, AS-IS 컬럼 기준으로 TO-BE 전체 후보를 스코어링한다.
+    """
     schema = load_schema()
-    to_be_table, to_be_col = to_be_column.split(".")
-    to_be_info = get_column_info(schema, "TO-BE", to_be_table, to_be_col) or {}
-    to_be_description = to_be_info.get("description")
+    anchor_table, anchor_col = anchor_column.split(".")
+    anchor_info = get_column_info(schema, anchor_side, anchor_table, anchor_col) or {}
+    anchor_description = anchor_info.get("description")
 
-    if to_be_description:
-        # ASIS 후보도 설명이 있는 애들 -> TOBE 설명 vs ASIS 설명 임베딩 코사인 유사도 비교
+    if anchor_description:
+        # 후보 중 설명이 있는 애들 -> 기준 설명 vs 후보 설명 임베딩 코사인 유사도 비교
         with_desc = [c for c in filtered_candidates if c.get("description")]
-        # ASIS 후보에 설명이 없는 애들 -> 컬럼명/타입/샘플값으로 LLM이 추론
+        # 후보 중 설명이 없는 애들 -> 컬럼명/타입/샘플값으로 LLM이 추론
         without_desc = [c for c in filtered_candidates if not c.get("description")]
     else:
-        # TO-BE 자체에 설명이 없으면 유사도 비교 기준이 없으므로 전부 자체추론으로 보낸다.
+        # 기준 컬럼 자체에 설명이 없으면 유사도 비교 기준이 없으므로 전부 자체추론으로 보낸다.
         with_desc, without_desc = [], filtered_candidates
 
     scores = []
-    # ASIS Description 이 있으면 (비교대상있음 벡터 유사도)
+    # 후보 Description 이 있으면 (비교대상있음 벡터 유사도)
     if with_desc:
         # 벡터 유사도 비교
-        scores.extend(_score_by_description_similarity(to_be_description, with_desc))
-    # TOBE Desc는 있는데 ASIS가 없는경우 + TOBE Desc부터 없는 경우
+        scores.extend(_score_by_description_similarity(anchor_description, with_desc))
+    # 기준 Desc는 있는데 후보가 없는 경우 + 기준 Desc부터 없는 경우
     if without_desc:
-        confirmed_hints = _get_confirmed_mappings(exclude_column=to_be_column)
+        confirmed_hints = _get_confirmed_mappings(exclude_column=anchor_column) if anchor_side == "TO-BE" else []
         # 자체추론
-        scores.extend(_score_by_self_inference(to_be_column, to_be_description, without_desc, confirmed_hints))
+        scores.extend(
+            _score_by_self_inference(anchor_column, anchor_description, without_desc, confirmed_hints, anchor_side)
+        )
 
     scores.sort(key=lambda s: s["score"], reverse=True)
-    return {"to_be_column": to_be_column, "evidence_scores": scores}
+    return {"to_be_column": anchor_column, "evidence_scores": scores}
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -108,11 +119,13 @@ def _score_by_description_similarity(to_be_description: str, candidates: list[di
 
 # 자체추론
 def _score_by_self_inference(
-    to_be_column: str,
-    to_be_description: str | None,
+    anchor_column: str,
+    anchor_description: str | None,
     candidates: list[dict],
     confirmed_hints: list[dict],
+    anchor_side: str = "TO-BE",
 ) -> list[dict]:
+    candidate_side = "AS-IS" if anchor_side == "TO-BE" else "TO-BE"
     candidate_lines = [
         f"- {c['table']}.{c['column']} (타입: {c.get('type')}, 샘플값: {c.get('sample_data')})" for c in candidates
     ]
@@ -122,9 +135,9 @@ def _score_by_self_inference(
     ]
 
     prompt = (
-        f"TO-BE 컬럼 '{to_be_column}'"
-        + (f" (설명: {to_be_description})" if to_be_description else " (설명 없음)")
-        + "에 대해 아래 AS-IS 후보 중 어느 것이 올바른 매핑인지 판단하라.\n"
+        f"{anchor_side} 컬럼 '{anchor_column}'"
+        + (f" (설명: {anchor_description})" if anchor_description else " (설명 없음)")
+        + f"에 대해 아래 {candidate_side} 후보 중 어느 것이 올바른 매핑인지 판단하라.\n"
         "각 후보는 description이 없으므로 컬럼명, 데이터 타입, 샘플값만으로 추론해야 한다.\n\n"
         "후보:\n" + "\n".join(candidate_lines) + "\n\n"
         + (

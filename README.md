@@ -29,6 +29,10 @@ graph TD;
 	__start__([__start__]):::first
 	lookup_mapping_candidates(lookup_mapping_candidates)
 	lookup_reverse_mapping(lookup_reverse_mapping)
+	discover_as_is_candidates(discover_as_is_candidates)
+	discover_to_be_candidates(discover_to_be_candidates)
+	filter_by_type_reverse(filter_by_type_reverse)
+	infer_secondary_evidence_reverse(infer_secondary_evidence_reverse)
 	generate_reverse_rationale(generate_reverse_rationale)
 	filter_by_type(filter_by_type)
 	check_code_match(check_code_match)
@@ -48,25 +52,37 @@ graph TD;
 	__end__([__end__]):::last
 	__start__ --> classify_intent;
 	check_code_match -.-> generate_rationale;
+	check_code_match -.-> generate_reverse_rationale;
 	check_code_match -.-> infer_secondary_evidence;
+	check_code_match -.-> infer_secondary_evidence_reverse;
 	classify_intent -.-> handle_exception;
 	classify_intent -.-> lookup_mapping_candidates;
 	classify_intent -.-> lookup_reverse_mapping;
 	classify_intent -.-> search_schema;
+	discover_as_is_candidates -.-> filter_by_type;
+	discover_as_is_candidates -.-> handle_exception;
+	discover_to_be_candidates -.-> filter_by_type_reverse;
+	discover_to_be_candidates -.-> handle_exception;
 	execute_sql -.-> format_report_response;
 	execute_sql -.-> generate_sql;
 	execute_sql -.-> handle_exception;
 	filter_by_type -.-> check_code_match;
 	filter_by_type -.-> handle_exception;
+	filter_by_type_reverse -.-> check_code_match;
+	filter_by_type_reverse -.-> handle_exception;
 	generate_rationale --> format_response;
 	generate_reverse_rationale --> format_response;
 	generate_sql --> validate_readonly;
 	infer_secondary_evidence --> judge_and_rank;
+	infer_secondary_evidence_reverse --> judge_and_rank;
 	judge_and_rank -.-> generate_rationale;
+	judge_and_rank -.-> generate_reverse_rationale;
 	judge_and_rank -.-> handle_exception;
 	judge_and_rank -.-> request_clarification;
+	lookup_mapping_candidates -.-> discover_as_is_candidates;
 	lookup_mapping_candidates -.-> filter_by_type;
 	lookup_mapping_candidates -.-> handle_exception;
+	lookup_reverse_mapping -.-> discover_to_be_candidates;
 	lookup_reverse_mapping -.-> generate_reverse_rationale;
 	lookup_reverse_mapping -.-> handle_exception;
 	request_clarification --> judge_and_rank;
@@ -89,6 +105,8 @@ LangGraph로 조립된 판단 체인입니다. `classify_intent`가 그래프의
 **SC-001(정방향, TO-BE→AS-IS)**: 정형 데이터(매핑정의서·코드 매핑정의서)는 벡터 검색이 아니라 정확 조회를 쓰고, 근거가 확실한 케이스는 결정적 로직만으로 바로 확정됩니다. 후보가 여러 개인데 결정적 로직으로 못 가리면 임베딩 유사도/LLM 자체추론(`infer_secondary_evidence`)으로 점수를 매기고, 그 점수차(`confidence_gap`)를 기준으로 `judge_and_rank`가 최종 confirmed/ambiguous/insufficient_metadata를 판정합니다. confirmed가 아니면 `request_clarification`이 실제로 사람에게 되묻고 답을 반영해 재점수화한 뒤 `judge_and_rank`로 되돌아갑니다(루프, 최대 2회) — 그래도 안 풀리면 `handle_exception`이 정직하게 종료합니다. confirmed로 확정되는 경로는 전부 `generate_rationale`을 거쳐 `format_response`로 가는데, 여기서 `confidence_gap` 퍼센트 같은 내부 계산값 대신 사람이 읽기 좋은 근거 문장으로 바꿔서 최종 응답에 담습니다.
 
 **SC-001(역방향, AS-IS→TO-BE, 2026-09-08 추가)**: `classify_intent`가 (자연어 포함) 입력을 AS-IS 컬럼 질문으로 판단하면 `lookup_reverse_mapping`으로 갑니다. 매핑정의서 entries를 스캔해 이 AS-IS 컬럼을 candidates로 갖는 entry를 찾는 역인덱스 조회라(현재 데이터 기준 AS-IS 컬럼 하나가 둘 이상의 TO-BE 컬럼에 걸치는 경우 0건) 정방향과 달리 후보 랭킹 파이프라인(`filter_by_type`~`judge_and_rank`)을 타지 않고, 매치가 1건이면 `generate_reverse_rationale`(`generate_rationale` 재사용)로 바로 근거 문장을 만들어 `format_response`로 합류합니다(`direction` 필드로 정방향/역방향 구분). 0건이면 `reverse_no_match`, 2건 이상이면 `reverse_ambiguous`로 종료합니다. 컬럼명만으로는 TO-BE/AS-IS 어느 쪽인지, AS-IS 안에서도 어느 테이블인지 겹치는 경우가 실제로 있어서(`settle_method_cd`는 TO-BE `ACC_WHT_AGG`와 AS-IS `LBR_WHT`/`INT_WHT` 양쪽에 다 있음), `classify_intent`가 방향을 확신 못 하면 억지로 추측하지 않고 `direction_ambiguous`로 사용자에게 다시 물어봅니다.
+
+**후보 자동 탐색(2026-09-09 추가)**: `lookup_mapping_candidates`/`lookup_reverse_mapping`이 매핑정의서에 등록이 없어서 `no_match`가 나올 상황(컬럼 자체는 실존)이면, 곧바로 실패시키지 않고 `discover_as_is_candidates`/`discover_to_be_candidates`가 반대편 스키마 **전체**를 후보 풀로 삼아 기존 판정 파이프라인(`filter_by_type`→`check_code_match`→`infer_secondary_evidence`→`judge_and_rank`)에 그대로 태웁니다. 다만 사람이 사전에 검증해 둔 등록 매핑이 아니라서 **더 엄격한 임계값**(`DISCOVERY_LOW_CONFIDENCE_THRESHOLD=0.75`, `DISCOVERY_CONFIDENCE_GAP_THRESHOLD=0.20` — 등록 매핑 기준 0.5/0.10보다 높음)을 적용하고, `request_clarification` 되묻기 루프는 타지 않습니다(등록 안 된 걸 스스로 찾는 것이므로 한 번에 확신이 안 서면 사람에게 되묻지 않고 정직하게 `discovery_inconclusive`로 종료). confirmed로 나오면 근거 문장에 "매핑정의서에 등록된 게 아니라 자동으로 탐색해 찾은 결과"임을 명시합니다. 정방향(`discover_as_is_candidates`→`filter_by_type`)과 역방향(`discover_to_be_candidates`→`filter_by_type_reverse`→`infer_secondary_evidence_reverse`) 양쪽 다 지원합니다.
 
 **SC-002**: "차세대 마이그레이션이 끝나서 관련 TO-BE 테이블들에 실제 데이터가 이미 채워져 있다"는 그림으로, AS-IS 테이블을 쿼리 시점에 조인하지 않습니다. `search_schema`가 `data/join_rules.json`(사전 정의된 조인 규칙 + 고정된 신고서 양식 — 소스가 전부 TO-BE 테이블: 배당소득=`ACC_WHT_AGG`, 기타소득=`ACC_ETC_INCOME_AGG`, 사업소득=`ACC_BIZ_INCOME_AGG`)을 정확 조회하고, 각 소스 컬럼이 `schema.json`에 실제로 존재하고 타입이 맞는지 결정적 도구(`filter_by_type`)로 재검증합니다(하나라도 어긋나면 리포트 전체를 `mapping_not_ready`로 차단). `classify_intent`가 매긴 `sc002_mode`로 여기서 갈라지는데, "explore"(예: "관련 테이블 다 찾아줘")면 검증된 테이블/컬럼 정보만 바로 응답하고 끝나고(`format_schema_response`), "execute"(예: "뽑아줘")면 `generate_sql`이 사용자 요청에 맞는 소스 테이블만 골라(2개 이상이면 `UNION ALL`) SELECT 전용 SQL을 생성합니다 — 요청에 기간이 언급되면 지급일자(`pay_dt`) 기준 WHERE 조건도 추가합니다. `validate_readonly`가 쓰기 쿼리를 결정적으로 차단하고, 통과한 SQL만 `execute_sql`이 실제 SQLite(`data/demo.db`)에 실행합니다. 실행이 실패하면 에러를 반영해 `generate_sql`로 되돌아가는 self_correct 루프(최대 3회) 후에도 안 풀리면 `handle_exception`이 종료합니다.
 
@@ -114,6 +132,7 @@ LangGraph로 조립된 판단 체인입니다. `classify_intent`가 그래프의
 - [x] Streamlit 데모 뷰어 (`app.py`) — 입력 하나로 SC-001/SC-002를 모두 받음(`classify_intent`로 먼저 분류). SC-001 정방향은 `judge_and_rank`/`request_clarification`/`generate_rationale`까지 반영해 실시간 판정·되묻기·최종 근거 UI 표시(`st.session_state` 기반), SC-001 역방향(2026-09-08 추가)은 `lookup_reverse_mapping`→`generate_rationale`만으로 바로 확정 또는 no_match/ambiguous/방향불명 메시지 표시, SC-002는 `search_schema` 이후 `sc002_mode`로 갈라져 explore면 테이블 정보만, execute면 `generate_sql`→`validate_readonly`→`execute_sql`(self_correct 재시도 포함)까지 버튼 클릭 한 번 안에서 실행해 생성 SQL+실행 결과 표 또는 예외 메시지를 표시. 처리 중 진행 상황은 `st.status()`로 각 단계(결정적 로직 포함)를 한 줄씩 아래로 쌓아 보여줌(2026-09-09 추가 — 이전엔 `st.spinner`라 단계별 메시지가 떴다 사라졌음)
 - [x] `classify_intent` — 컬럼 하나의 매핑 질문(SC-001, 자연어 문장이어도)인지 여러 컬럼을 모은 신고서 요청(SC-002)인지 의미 기준으로 LLM 분류. SC-001이면 TO-BE→AS-IS 정방향인지 AS-IS→TO-BE 역방향인지도 함께 판단(2026-09-08 추가) — 컬럼명만으로 방향/테이블조차 특정 못 하면 추측하지 않고 둘 다 null로 반환해 되묻기로 유도. SC-002면 탐색(`explore`)/실행(`execute`) 의도까지 함께 분류
 - [x] SC-002(신고서용 집계 쿼리 생성) — `search_schema`(TO-BE 3개 소스 테이블 정확 조회 + 구조 검증) → (`explore`) `format_schema_response`로 바로 종료 / (`execute`) `generate_sql`(LLM, 기간 WHERE 필터 포함) → `validate_readonly`(결정적, Read-only 검증) → `execute_sql`(실제 SQLite 실행, 실패 시 최대 3회 self_correct) → `format_report_response`. 배당·기타·사업소득 리포트 1건 Vertical Slice로 범위 한정
+- [x] 후보 자동 탐색(`src/discovery.py`, 2026-09-09 추가) — 매핑정의서에 등록이 없는 컬럼(정방향/역방향 모두)을 `no_match`로 바로 끝내지 않고, 반대편 스키마 전체를 후보로 삼아 기존 판정 파이프라인을 더 엄격한 임계값으로 재사용. 되묻기 루프 없이 confirmed 또는 정직한 `discovery_inconclusive`로 단판 종료
 
 ### 골든셋 14건 — 시연 가능한 케이스
 
@@ -165,6 +184,9 @@ SCHEMABRIDGE_SKIP_LLM_TESTS=1 .venv/bin/python tests/test_sc002.py
 .venv/bin/python -m src.graph
 .venv/bin/python -m src.graph ACC_WHT_AGG.wht_tax_amt   # SC-001: 정방향(TO-BE→AS-IS), 특정 컬럼만
 .venv/bin/python -m src.graph "LBR_WHT.wht_amt가 TO-BE 어디로 매핑돼?"   # SC-001: 역방향(AS-IS→TO-BE)
+.venv/bin/python -m src.graph ACC_WHT_AGG.lbr_pay_amt   # SC-001: 후보 자동 탐색(정방향, 등록 안 된 컬럼) — 탐색 성공
+.venv/bin/python -m src.graph ACC_WHT_AGG.data_quality_flag_cd   # SC-001: 후보 자동 탐색 — 정직한 탐색 실패
+.venv/bin/python -m src.graph "INT_WHT.rate_cd가 TO-BE 어디로 매핑돼?"   # SC-001: 후보 자동 탐색(역방향) — 탐색 성공
 .venv/bin/python -m src.graph "2026년 1분기 원천세 신고서용 집계 데이터 뽑아줘"   # SC-002: execute
 .venv/bin/python -m src.graph "원천세 집계 관련된 테이블 다 찾아줘"   # SC-002: explore
 
@@ -191,8 +213,9 @@ schemabridge/
 │   ├── filters.py           Node: filter_by_type
 │   ├── code_match.py        Node: check_code_match
 │   ├── llm_client.py        Azure OpenAI 공용 클라이언트 (Structured Output / 임베딩)
-│   ├── evidence.py          Node: infer_secondary_evidence
+│   ├── evidence.py          Node: infer_secondary_evidence / infer_secondary_evidence_reverse
 │   ├── judge.py             Node: judge_and_rank
+│   ├── discovery.py         Node: discover_as_is_candidates / discover_to_be_candidates (후보 자동 탐색)
 │   ├── clarification.py     Node: request_clarification (질문 생성 + 답변 반영 재점수화)
 │   ├── rationale.py         Node: generate_rationale (사용자 노출용 최종 근거 문장 생성)
 │   ├── intent.py            Node: classify_intent (SC-001/SC-002 분류, LLM)

@@ -67,6 +67,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.clarification import MAX_ATTEMPTS, build_clarification_question, rescore_with_clarification
 from src.code_match import check_code_match
+from src.data_loader import get_column_info, load_schema
+from src.discovery import (
+    DISCOVERY_CONFIDENCE_GAP_THRESHOLD,
+    DISCOVERY_LOW_CONFIDENCE_THRESHOLD,
+    discover_as_is_candidates,
+    discover_to_be_candidates,
+)
 from src.evidence import infer_secondary_evidence
 from src.filters import filter_by_type
 from src.intent import classify_intent
@@ -84,6 +91,7 @@ class AgentState(TypedDict, total=False):
     to_be_column: str
     as_is_column: str | None  # 역방향(AS-IS -> TO-BE) 조회 시에만 채워짐
     reverse_matches: list[dict]
+    discovered: bool  # 매핑정의서 등록 없이 스키마 전체를 탐색해 찾은 후보인지(2026-09-09 추가)
     candidates: list[dict]
     source_version: str | None
     status_hint: str | None
@@ -138,7 +146,13 @@ def lookup_reverse_node(state: AgentState) -> dict:
     as_is_table, as_is_col = state["as_is_column"].split(".", 1)
     result = lookup_reverse_mapping(as_is_table, as_is_col)
     if not result["matches"]:
-        return {"exception_status": "reverse_no_match", "route": "handle_exception"}
+        # "matches 0건"은 두 경우를 다 포함한다: (a) AS-IS 컬럼 자체가 현재 스키마에 없음,
+        # (b) 컬럼은 있는데 매핑정의서 어느 entry도 이걸 candidates로 등록하지 않음.
+        # (a)는 앵커 자체가 무효라 탐색이 의미 없고, (b)만 탐색 대상이다(2026-09-09 추가).
+        schema = load_schema()
+        if get_column_info(schema, "AS-IS", as_is_table, as_is_col) is None:
+            return {"exception_status": "reverse_no_match", "route": "handle_exception"}
+        return {"route": "discover_to_be_candidates"}
     if len(result["matches"]) > 1:
         return {
             "reverse_matches": result["matches"],
@@ -148,21 +162,75 @@ def lookup_reverse_node(state: AgentState) -> dict:
     return {"to_be_column": result["matches"][0]["to_be_column"], "route": "generate_reverse_rationale"}
 
 
+def discover_as_is_node(state: AgentState) -> dict:
+    # 정방향 탐색(2026-09-09 추가): lookup_mapping_candidates가 no_match(매핑정의서에
+    # 등록 자체가 없음)일 때, AS-IS 스키마 전체를 후보로 삼아 기존 filter_by_type 이하
+    # 판정 파이프라인에 그대로 태운다(src/discovery.py 참고).
+    candidates = discover_as_is_candidates(state["to_be_column"])
+    if not candidates:
+        return {"status_hint": "no_match", "route": "handle_exception"}
+    return {"candidates": candidates, "discovered": True, "route": "filter_by_type"}
+
+
+def discover_to_be_node(state: AgentState) -> dict:
+    # 역방향 탐색(2026-09-09 추가): TO-BE 스키마 전체를 후보로 삼는다. 정방향과 달리
+    # 앵커가 AS-IS 컬럼이라 filter_by_type/infer_secondary_evidence를 anchor_side="AS-IS"로
+    # 불러야 해서 filter_by_type_reverse_node/infer_secondary_evidence_reverse_node를 새로 둔다.
+    candidates = discover_to_be_candidates(state["as_is_column"])
+    if not candidates:
+        return {"exception_status": "reverse_no_match", "route": "handle_exception"}
+    return {"candidates": candidates, "discovered": True, "route": "filter_by_type_reverse"}
+
+
+def filter_by_type_reverse_node(state: AgentState) -> dict:
+    result = filter_by_type(state["as_is_column"], state["candidates"], anchor_side="AS-IS")
+    if not result["filtered"] or result["unknown_type"]:
+        route = "handle_exception"
+    else:
+        route = "check_code_match"  # check_code_match_node가 as_is_column 존재로 방향을 스스로 판단
+    return {
+        "filtered_candidates": result["filtered"],
+        "excluded_candidates": result["excluded"],
+        "unknown_type": result["unknown_type"],
+        "exception_status": "reverse_no_match" if route == "handle_exception" else None,
+        "route": route,
+    }
+
+
+def infer_secondary_evidence_reverse_node(state: AgentState) -> dict:
+    result = infer_secondary_evidence(state["as_is_column"], state["filtered_candidates"], anchor_side="AS-IS")
+    return {"evidence_scores": result["evidence_scores"]}
+
+
 def generate_reverse_rationale_node(state: AgentState) -> dict:
-    # 역방향은 후보 랭킹이 없어(lookup_reverse_mapping이 이미 단일 확정) filter_by_type
-    # 이하 판정 파이프라인을 태우지 않고, generate_rationale만 그대로 재사용해 바로
-    # 근거 문장을 만든다. generate_rationale은 "TO-BE X는 AS-IS Y로 매핑됐다"는 동일한
-    # 사실을 설명하므로 정방향/역방향 어느 쪽에서 호출해도 그대로 재사용 가능하다.
+    # 역방향(단순 조회)은 후보 랭킹이 없어(lookup_reverse_mapping이 이미 단일 확정)
+    # filter_by_type 이하 판정 파이프라인을 태우지 않고 바로 근거 문장을 만든다.
+    # 역방향 탐색(2026-09-09 추가)은 judge_and_rank_node가 랭킹까지 마친 뒤 이 노드로
+    # 합류하므로 ranked_result/discovered가 채워져 있으면 그대로 rationale에 반영한다.
+    # generate_rationale은 "TO-BE X는 AS-IS Y로 매핑됐다"는 동일한 사실을 설명하므로
+    # 정방향/역방향, 단순조회/탐색 어느 쪽에서 호출해도 그대로 재사용 가능하다.
     as_is_table, as_is_col = state["as_is_column"].split(".", 1)
     winner = {"table": as_is_table, "column": as_is_col}
-    rationale = generate_rationale(to_be_column=state["to_be_column"], winner=winner)
+    rationale = generate_rationale(
+        to_be_column=state["to_be_column"],
+        winner=winner,
+        ranked_result=state.get("ranked_result"),
+        discovered=state.get("discovered", False),
+    )
     return {"judged_winner": winner, "rationale": rationale}
 
 
 def lookup_node(state: AgentState) -> dict:
     result = lookup_mapping_candidates(state["to_be_column"])
-    # lookup_mapping_candidates 를 실행하고 result의 status_hint 값을 보고 다음 노드는 어디로갈지 판단
-    route = "handle_exception" if result["status_hint"] in ("no_match", "version_mismatch") else "filter_by_type"
+    # lookup_mapping_candidates 를 실행하고 result의 status_hint 값을 보고 다음 노드는 어디로갈지 판단.
+    # no_match(매핑정의서에 등록 자체가 없음)만 탐색으로 보낸다(2026-09-09 추가) — version_mismatch
+    # (등록은 있는데 그 AS-IS 컬럼이 스키마에서 사라짐)는 탐색 대상이 아니라 그대로 예외 처리.
+    if result["status_hint"] == "no_match":
+        route = "discover_as_is_candidates"
+    elif result["status_hint"] == "version_mismatch":
+        route = "handle_exception"
+    else:
+        route = "filter_by_type"
     return {
         "candidates": result["candidates"],
         "source_version": result["source_version"],
@@ -189,10 +257,30 @@ def filter_node(state: AgentState) -> dict:
 
 
 def code_match_node(state: AgentState) -> dict:
+    # is_reverse: 역방향 탐색(discover_to_be_node를 거쳐 as_is_column이 앵커인 경우)만
+    # True다. 역방향 "단순 조회"(lookup_reverse_node)는 이 노드를 거치지 않고 바로
+    # generate_reverse_rationale로 가므로 여기 도달하는 역방향은 항상 탐색이다(2026-09-09 추가).
+    is_reverse = bool(state.get("as_is_column"))
     results = check_code_match(state["filtered_candidates"])
     matched = [r for r in results if r["matched"]]
-    if len(state["filtered_candidates"]) == 1 or len(matched) == 1:
+    shortcut = len(state["filtered_candidates"]) == 1 or len(matched) == 1
+
+    if shortcut and is_reverse:
+        if len(state["filtered_candidates"]) == 1:
+            winner = state["filtered_candidates"][0]
+        else:
+            matched_keys = {(r["table"], r["column"]) for r in matched}
+            winner = next(c for c in state["filtered_candidates"] if (c["table"], c["column"]) in matched_keys)
+        return {
+            "code_match_results": results,
+            "to_be_column": f"{winner['table']}.{winner['column']}",
+            "route": "generate_reverse_rationale",
+        }
+
+    if shortcut:
         route = "generate_rationale"
+    elif is_reverse:
+        route = "infer_secondary_evidence_reverse"
     else:
         route = "infer_secondary_evidence"
     return {"code_match_results": results, "route": route}
@@ -204,19 +292,45 @@ def infer_secondary_evidence_node(state: AgentState) -> dict:
 
 
 def judge_and_rank_node(state: AgentState) -> dict:
-    result = judge_and_rank(state["evidence_scores"], state["code_match_results"])
+    # discovered면 더 엄격한 임계값을 쓴다(2026-09-09 추가) — 매핑정의서에 등록되어 사람이
+    # 미리 검증한 후보가 아니라 시스템이 스스로 찾아낸 후보라서, 확신이 더 클 때만 confirmed.
+    discovered = state.get("discovered", False)
+    if discovered:
+        result = judge_and_rank(
+            state["evidence_scores"],
+            state["code_match_results"],
+            DISCOVERY_LOW_CONFIDENCE_THRESHOLD,
+            DISCOVERY_CONFIDENCE_GAP_THRESHOLD,
+        )
+    else:
+        result = judge_and_rank(state["evidence_scores"], state["code_match_results"])
+
+    is_reverse = bool(state.get("as_is_column"))
+    extra: dict = {}
+
     if result["status"] == "confirmed":
-        route = "generate_rationale"
+        if is_reverse:
+            winner = result["winner"]
+            extra["to_be_column"] = f"{winner['table']}.{winner['column']}"
+            route = "generate_reverse_rationale"
+        else:
+            route = "generate_rationale"
+    elif discovered:
+        # 탐색 경로는 되묻기 루프 없이, 엄격한 기준으로 판정한 결과를 그대로 정직하게 종료한다.
+        route = "handle_exception"
+        extra["exception_status"] = "discovery_inconclusive"
     elif state.get("clarification_attempts", 0) >= MAX_ATTEMPTS:
         route = "handle_exception"
     else:
         route = "request_clarification"
+
     return {
         "confidence_gap": result["confidence_gap"],
         "ranked_result": result["ranked_result"],
         "judged_winner": result["winner"],
         "judged_status": result["status"],
         "route": route,
+        **extra,
     }
 
 
@@ -289,15 +403,38 @@ def handle_exception_node(state: AgentState) -> dict:
                 "candidates": [m["to_be_column"] for m in matches],
             },
         }
+    if sc002_status == "discovery_inconclusive":
+        # 매핑정의서 등록 없이 스키마 전체를 탐색했지만(2026-09-09 추가), 등록된 매핑보다
+        # 엄격한 임계값(src/discovery.py)으로도 confirmed에 못 미친 경우 — 되묻기 루프
+        # 없이 정직하게 종료하고, 참고할 수 있는 상위 후보를 그대로 노출한다.
+        ranked = state.get("ranked_result") or []
+        preview = [f"{r['table']}.{r['column']} (점수 {r['score']})" for r in ranked[:5]]
+        is_reverse = bool(state.get("as_is_column"))
+        anchor_key = {"as_is_column": state.get("as_is_column")} if is_reverse else {"to_be_column": state.get("to_be_column")}
+        anchor_label = f"AS-IS 컬럼 '{state.get('as_is_column')}'" if is_reverse else f"TO-BE 컬럼 '{state.get('to_be_column')}'"
+        return {
+            "exception_status": sc002_status,
+            "final_answer": {
+                **anchor_key,
+                "status": state.get("judged_status") or "insufficient_metadata",
+                "reason": f"{anchor_label}은 매핑정의서에 등록되어 있지 않아 반대편 스키마 "
+                "전체를 탐색했지만, 등록된 매핑보다 엄격한 기준으로도 확신할 수 있는 후보를 "
+                "찾지 못했습니다. 사람의 검토가 필요합니다.",
+                "candidates_considered": preview,
+            },
+        }
 
     if state.get("status_hint") in ("no_match", "version_mismatch"):
         status = state["status_hint"]
-        reason = (
-            "매핑정의서에 해당 TO-BE 컬럼 자체가 없음"
-            if status == "no_match"
-            else f"매핑정의서(source_version={state.get('source_version')})가 가리키는 "
-            "AS-IS 컬럼이 현재 스키마에 없음"
-        )
+        if status == "no_match" and state.get("discovered"):
+            reason = "매핑정의서에 등록이 없어 반대편 스키마 전체를 탐색했지만, 타입이 맞는 후보조차 하나도 없음"
+        elif status == "no_match":
+            reason = "매핑정의서에 해당 TO-BE 컬럼 자체가 없음"
+        else:
+            reason = (
+                f"매핑정의서(source_version={state.get('source_version')})가 가리키는 "
+                "AS-IS 컬럼이 현재 스키마에 없음"
+            )
     elif not state.get("filtered_candidates"):
         status, reason = "no_match", "타입 필수조건을 통과하는 후보가 하나도 없음(타입 충돌)"
     elif state.get("judged_status") in ("ambiguous", "insufficient_metadata"):
@@ -347,6 +484,7 @@ def generate_rationale_node(state: AgentState) -> dict:
         winner=winner,
         ranked_result=ranked_result,
         clarification_answers=state.get("clarification_answers"),
+        discovered=state.get("discovered", False),
     )
     return {"judged_winner": winner, "rationale": rationale}
 
@@ -360,6 +498,7 @@ def format_response_node(state: AgentState) -> dict:
             "to_be_column": state["to_be_column"],
             "status": "confirmed",
             "direction": direction,
+            "discovered": state.get("discovered", False),  # 2026-09-09 추가 — 등록된 매핑인지 탐색으로 찾은 건지
             "table": winner["table"],
             "column": winner["column"],
             "reason": state["rationale"],
@@ -472,6 +611,10 @@ def build_graph():
 
     graph.add_node("lookup_mapping_candidates", lookup_node)
     graph.add_node("lookup_reverse_mapping", lookup_reverse_node)
+    graph.add_node("discover_as_is_candidates", discover_as_is_node)
+    graph.add_node("discover_to_be_candidates", discover_to_be_node)
+    graph.add_node("filter_by_type_reverse", filter_by_type_reverse_node)
+    graph.add_node("infer_secondary_evidence_reverse", infer_secondary_evidence_reverse_node)
     graph.add_node("generate_reverse_rationale", generate_reverse_rationale_node)
     graph.add_node("filter_by_type", filter_node)
     graph.add_node("check_code_match", code_match_node)
@@ -506,12 +649,35 @@ def build_graph():
     graph.add_conditional_edges(
         "lookup_mapping_candidates",
         lambda s: s["route"],
-        {"filter_by_type": "filter_by_type", "handle_exception": "handle_exception"},
+        {
+            "filter_by_type": "filter_by_type",
+            "discover_as_is_candidates": "discover_as_is_candidates",
+            "handle_exception": "handle_exception",
+        },
     )
     graph.add_conditional_edges(
         "lookup_reverse_mapping",
         lambda s: s["route"],
-        {"generate_reverse_rationale": "generate_reverse_rationale", "handle_exception": "handle_exception"},
+        {
+            "generate_reverse_rationale": "generate_reverse_rationale",
+            "discover_to_be_candidates": "discover_to_be_candidates",
+            "handle_exception": "handle_exception",
+        },
+    )
+    graph.add_conditional_edges(
+        "discover_as_is_candidates",
+        lambda s: s["route"],
+        {"filter_by_type": "filter_by_type", "handle_exception": "handle_exception"},
+    )
+    graph.add_conditional_edges(
+        "discover_to_be_candidates",
+        lambda s: s["route"],
+        {"filter_by_type_reverse": "filter_by_type_reverse", "handle_exception": "handle_exception"},
+    )
+    graph.add_conditional_edges(
+        "filter_by_type_reverse",
+        lambda s: s["route"],
+        {"check_code_match": "check_code_match", "handle_exception": "handle_exception"},
     )
     graph.add_edge("generate_reverse_rationale", "format_response")
     graph.add_conditional_edges(
@@ -522,14 +688,21 @@ def build_graph():
     graph.add_conditional_edges(
         "check_code_match",
         lambda s: s["route"],
-        {"generate_rationale": "generate_rationale", "infer_secondary_evidence": "infer_secondary_evidence"},
+        {
+            "generate_rationale": "generate_rationale",
+            "generate_reverse_rationale": "generate_reverse_rationale",
+            "infer_secondary_evidence": "infer_secondary_evidence",
+            "infer_secondary_evidence_reverse": "infer_secondary_evidence_reverse",
+        },
     )
     graph.add_edge("infer_secondary_evidence", "judge_and_rank")
+    graph.add_edge("infer_secondary_evidence_reverse", "judge_and_rank")
     graph.add_conditional_edges(
         "judge_and_rank",
         lambda s: s["route"],
         {
             "generate_rationale": "generate_rationale",
+            "generate_reverse_rationale": "generate_reverse_rationale",
             "request_clarification": "request_clarification",
             "handle_exception": "handle_exception",
         },

@@ -49,6 +49,13 @@ import streamlit as st
 from src.lookup import lookup_mapping_candidates, lookup_reverse_mapping
 from src.filters import filter_by_type
 from src.code_match import check_code_match
+from src.data_loader import get_column_info, load_schema
+from src.discovery import (
+    DISCOVERY_CONFIDENCE_GAP_THRESHOLD,
+    DISCOVERY_LOW_CONFIDENCE_THRESHOLD,
+    discover_as_is_candidates,
+    discover_to_be_candidates,
+)
 from src.evidence import infer_secondary_evidence
 from src.judge import judge_and_rank
 from src.clarification import MAX_ATTEMPTS, build_clarification_question, rescore_with_clarification
@@ -127,6 +134,23 @@ def render_result(result: dict) -> None:
         st.success(f"CONFIRMED — {result['as_is_column']} → {result['to_be_column']}\n\n{result['rationale']}")
         return
 
+    if result["kind"] == "discovery_inconclusive":
+        # 2026-09-09 추가: 매핑정의서 등록 없이 스키마 전체를 탐색했지만, 등록된 매핑보다
+        # 엄격한 임계값으로도 confirmed에 못 미친 경우 — 되묻기 루프 없이 상위 후보만 보여준다.
+        anchor = result.get("as_is_column") or result.get("to_be_column")
+        ranked = result.get("ranked_result") or []
+        st.warning(
+            f"{result['judged_status'].upper()} — '{anchor}'은 매핑정의서에 등록되어 있지 않아 "
+            "반대편 스키마 전체를 탐색했지만, 확신할 수 있는 후보를 찾지 못했습니다. "
+            "사람의 검토가 필요합니다."
+        )
+        if ranked:
+            st.table([
+                {"테이블": r["table"], "컬럼": r["column"], "점수": r["score"], "근거": r["rationale"]}
+                for r in ranked[:5]
+            ])
+        return
+
     if result["kind"] == "report":
         render_report_result(result)
         return
@@ -161,6 +185,9 @@ def render_result(result: dict) -> None:
         with st.expander(f"타입 불일치로 제외된 후보 {len(filter_result['excluded'])}건"):
             for e in filter_result["excluded"]:
                 st.write(f"- {e['candidate']['table']}.{e['candidate']['column']}: {e['reason']}")
+
+    if result.get("discovered"):
+        st.caption("🔍 매핑정의서에 등록된 매핑이 아니라, AS-IS 스키마 전체를 자동 탐색해 찾은 결과입니다.")
 
     clar = result.get("clarification")
     if clar is None:
@@ -282,13 +309,28 @@ def run_sc001(to_be_column: str, status) -> dict:
     status.write(f"🔎 lookup_mapping_candidates 조회 중 — `{to_be_column}`")
     lookup_result = lookup_mapping_candidates(to_be_column)
 
-    if lookup_result["status_hint"] in ("no_match", "version_mismatch"):
-        status.write(f"⚠️ {lookup_result['status_hint']} — 판정 종료")
+    if lookup_result["status_hint"] == "version_mismatch":
+        status.write("⚠️ version_mismatch — 판정 종료")
         return {"kind": "exception", "to_be_column": to_be_column, "lookup_result": lookup_result}
-    status.write(f"✅ AS-IS 후보 {len(lookup_result['candidates'])}건 확인")
+
+    # 2026-09-09 추가 — 매핑정의서 등록 자체가 없으면(no_match) 곧바로 포기하지 않고
+    # AS-IS 스키마 전체를 후보로 자동 탐색한다(src/discovery.py). 등록된 후보와 달리
+    # 사람이 미리 검증한 게 아니라서 아래 judge_and_rank를 더 엄격한 기준으로 호출한다.
+    discovered = False
+    if lookup_result["status_hint"] == "no_match":
+        status.write("ℹ️ 매핑정의서에 등록 없음 — AS-IS 스키마 전체 자동 탐색 시작")
+        candidates = discover_as_is_candidates(to_be_column)
+        if not candidates:
+            status.write("⚠️ 탐색해도 타입이 맞는 후보조차 없음 — no_match")
+            return {"kind": "exception", "to_be_column": to_be_column, "lookup_result": lookup_result}
+        status.write(f"✅ 탐색으로 AS-IS 전체 {len(candidates)}건을 후보로 확보")
+        discovered = True
+    else:
+        candidates = lookup_result["candidates"]
+        status.write(f"✅ AS-IS 후보 {len(candidates)}건 확인")
 
     status.write("🔎 filter_by_type 타입 필터링 중...")
-    filter_result = filter_by_type(to_be_column, lookup_result["candidates"])
+    filter_result = filter_by_type(to_be_column, candidates)
     status.write(f"✅ 타입 통과 후보 {len(filter_result['filtered'])}건")
 
     status.write("🔎 check_code_match 코드값 일치 확인 중...")
@@ -306,14 +348,33 @@ def run_sc001(to_be_column: str, status) -> dict:
         "code_results": code_results,
         "status": result_status,
         "clarification": None,
+        "discovered": discovered,
     }
 
     if "PENDING" in result_status:
         status.write("🤖 infer_secondary_evidence 호출 중 (Azure OpenAI)...")
         evidence_result = infer_secondary_evidence(to_be_column, filter_result["filtered"])
         status.write("✅ infer_secondary_evidence 완료 — 후보별 점수 산출")
-        judged = judge_and_rank(evidence_result["evidence_scores"], code_results)
+        if discovered:
+            judged = judge_and_rank(
+                evidence_result["evidence_scores"], code_results,
+                DISCOVERY_LOW_CONFIDENCE_THRESHOLD, DISCOVERY_CONFIDENCE_GAP_THRESHOLD,
+            )
+        else:
+            judged = judge_and_rank(evidence_result["evidence_scores"], code_results)
         status.write(f"✅ judge_and_rank 판정: {judged['status']}")
+
+        if discovered and judged["status"] != "confirmed":
+            # 탐색 경로는 되묻기 루프 없이, 엄격한 기준으로 판정한 결과를 그대로 정직하게 종료한다.
+            # (등록된 매핑 경로는 이 분기를 타지 않고 아래에서 항상 되묻기 루프로 간다 — 기존 동작 유지)
+            status.write("⚠️ 엄격한 기준으로도 확신할 수 있는 후보를 찾지 못함 — 탐색 종료")
+            return {
+                "kind": "discovery_inconclusive",
+                "to_be_column": to_be_column,
+                "judged_status": judged["status"],
+                "ranked_result": judged["ranked_result"],
+            }
+
         clarification = {
             "ranked_result": judged["ranked_result"],
             "status": judged["status"],
@@ -327,7 +388,7 @@ def run_sc001(to_be_column: str, status) -> dict:
         if judged["status"] == "confirmed":
             status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
             clarification["final_rationale"] = generate_rationale(
-                to_be_column, judged["winner"], ranked_result=judged["ranked_result"]
+                to_be_column, judged["winner"], ranked_result=judged["ranked_result"], discovered=discovered
             )
             status.write("✅ generate_rationale 완료 — CONFIRMED")
         else:
@@ -343,7 +404,7 @@ def run_sc001(to_be_column: str, status) -> dict:
             matched_keys = {(r["table"], r["column"]) for r in code_results if r["matched"]}
             winner = next(c for c in filter_result["filtered"] if (c["table"], c["column"]) in matched_keys)
         status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
-        result["final_rationale"] = generate_rationale(to_be_column, winner)
+        result["final_rationale"] = generate_rationale(to_be_column, winner, discovered=discovered)
         status.write("✅ generate_rationale 완료 — CONFIRMED")
         result["winner"] = winner
 
@@ -354,20 +415,97 @@ def run_sc001_reverse(as_is_column: str, status) -> dict:
     """SC-001 역방향(AS-IS -> TO-BE, 2026-09-08 추가). lookup_reverse_mapping은
     매핑정의서 역인덱스 조회라 후보 랭킹이 필요 없다(현재 데이터 기준 matches는
     0건 또는 1건) — filter_by_type/check_code_match/infer_secondary_evidence/
-    judge_and_rank를 태우지 않고 바로 확정하거나 no_match/ambiguous로 끝낸다."""
+    judge_and_rank를 태우지 않고 바로 확정하거나 no_match/ambiguous로 끝낸다.
+
+    2026-09-09 추가: matches가 0건이면서 AS-IS 컬럼 자체는 스키마에 존재하면(=매핑정의서
+    등록만 없는 경우) TO-BE 스키마 전체를 자동 탐색한다(src/discovery.py). 컬럼 자체가
+    스키마에 없으면 탐색할 앵커가 무효라 그대로 reverse_exception으로 끝낸다."""
     as_is_table, as_is_col = as_is_column.split(".", 1)
     status.write(f"🔎 lookup_reverse_mapping 역인덱스 조회 중 — `{as_is_column}`")
     reverse_result = lookup_reverse_mapping(as_is_table, as_is_col)
 
-    if len(reverse_result["matches"]) != 1:
+    if len(reverse_result["matches"]) > 1:
         status.write(f"⚠️ matches {len(reverse_result['matches'])}건 — 확정 불가")
         return {"kind": "reverse_exception", "as_is_column": as_is_column, "reverse_result": reverse_result}
-    status.write("✅ TO-BE 매핑 1건 확정")
 
-    winner_to_be_column = reverse_result["matches"][0]["to_be_column"]
-    winner = {"table": as_is_table, "column": as_is_col}
+    if len(reverse_result["matches"]) == 1:
+        status.write("✅ TO-BE 매핑 1건 확정")
+        winner_to_be_column = reverse_result["matches"][0]["to_be_column"]
+        winner = {"table": as_is_table, "column": as_is_col}
+        status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
+        rationale = generate_rationale(winner_to_be_column, winner)
+        status.write("✅ generate_rationale 완료 — CONFIRMED")
+        return {
+            "kind": "reverse_normal",
+            "as_is_column": as_is_column,
+            "to_be_column": winner_to_be_column,
+            "rationale": rationale,
+        }
+
+    # matches 0건: 스키마에 없는 컬럼(진짜 무효 앵커)인지, 등록만 없는 것인지 구분
+    schema = load_schema()
+    if get_column_info(schema, "AS-IS", as_is_table, as_is_col) is None:
+        status.write("⚠️ 현재 AS-IS 스키마에 없는 컬럼 — 확정 불가")
+        return {"kind": "reverse_exception", "as_is_column": as_is_column, "reverse_result": reverse_result}
+
+    status.write("ℹ️ 매핑정의서에 등록 없음 — TO-BE 스키마 전체 자동 탐색 시작")
+    candidates = discover_to_be_candidates(as_is_column)
+    if not candidates:
+        status.write("⚠️ 탐색해도 타입이 맞는 후보조차 없음 — no_match")
+        return {"kind": "reverse_exception", "as_is_column": as_is_column, "reverse_result": reverse_result}
+    status.write(f"✅ 탐색으로 TO-BE 전체 {len(candidates)}건을 후보로 확보")
+
+    status.write("🔎 filter_by_type 타입 필터링 중...")
+    filter_result = filter_by_type(as_is_column, candidates, anchor_side="AS-IS")
+    if not filter_result["filtered"] or filter_result["unknown_type"]:
+        status.write("⚠️ 타입 필수조건 통과 후보 없음 — no_match")
+        return {"kind": "reverse_exception", "as_is_column": as_is_column, "reverse_result": reverse_result}
+    status.write(f"✅ 타입 통과 후보 {len(filter_result['filtered'])}건")
+
+    status.write("🔎 check_code_match 코드값 일치 확인 중...")
+    code_results = check_code_match(filter_result["filtered"])
+    matched = [r for r in code_results if r["matched"]]
+
+    if len(filter_result["filtered"]) == 1 or len(matched) == 1:
+        winner = filter_result["filtered"][0] if len(filter_result["filtered"]) == 1 else next(
+            c for c in filter_result["filtered"] if (c["table"], c["column"]) in {(m["table"], m["column"]) for m in matched}
+        )
+        winner_to_be_column = f"{winner['table']}.{winner['column']}"
+        as_is_anchor = {"table": as_is_table, "column": as_is_col}
+        status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
+        rationale = generate_rationale(winner_to_be_column, as_is_anchor, discovered=True)
+        status.write("✅ generate_rationale 완료 — CONFIRMED")
+        return {
+            "kind": "reverse_normal",
+            "as_is_column": as_is_column,
+            "to_be_column": winner_to_be_column,
+            "rationale": rationale,
+        }
+
+    status.write("🤖 infer_secondary_evidence 호출 중 (Azure OpenAI)...")
+    evidence_result = infer_secondary_evidence(as_is_column, filter_result["filtered"], anchor_side="AS-IS")
+    status.write("✅ infer_secondary_evidence 완료 — 후보별 점수 산출")
+    judged = judge_and_rank(
+        evidence_result["evidence_scores"], code_results,
+        DISCOVERY_LOW_CONFIDENCE_THRESHOLD, DISCOVERY_CONFIDENCE_GAP_THRESHOLD,
+    )
+    status.write(f"✅ judge_and_rank 판정: {judged['status']}")
+
+    if judged["status"] != "confirmed":
+        status.write("⚠️ 엄격한 기준으로도 확신할 수 있는 후보를 찾지 못함 — 탐색 종료")
+        return {
+            "kind": "discovery_inconclusive",
+            "as_is_column": as_is_column,
+            "judged_status": judged["status"],
+            "ranked_result": judged["ranked_result"],
+        }
+
+    winner_to_be_column = f"{judged['winner']['table']}.{judged['winner']['column']}"
+    as_is_anchor = {"table": as_is_table, "column": as_is_col}
     status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
-    rationale = generate_rationale(winner_to_be_column, winner)
+    rationale = generate_rationale(
+        winner_to_be_column, as_is_anchor, ranked_result=judged["ranked_result"], discovered=True
+    )
     status.write("✅ generate_rationale 완료 — CONFIRMED")
 
     return {
@@ -484,6 +622,10 @@ st.caption(
     "매핑돼?\", 또는 \"이 AS-IS 컬럼(BIZ_INCOME.income_cd) 매핑되는 TO-BE 컬럼 찾아줘\"처럼 "
     "자연어로도 물어볼 수 있습니다. 컬럼명만으로 방향/테이블을 특정할 수 없으면 "
     "다시 질문해달라고 안내합니다.  \n"
+    "SC-001 예시(매핑정의서 미등록 컬럼 자동 탐색, 2026-09-09 추가): "
+    "\"ACC_WHT_AGG.lbr_pay_amt\"(탐색 성공 — LBR_WHT.pay_amt를 스스로 찾아냄), "
+    "\"ACC_WHT_AGG.data_quality_flag_cd\"(탐색해도 확신할 후보 없어 정직하게 종료), "
+    "\"INT_WHT.rate_cd가 TO-BE 어디로 매핑돼?\"(역방향 탐색 성공 — tax_rate로 확정)  \n"
     "SC-002 예시(execute, 기간 미지정 전체 조회): \"원천세(배당·기타·사업소득) 신고서용 전체 집계 "
     "데이터 뽑아줘\"  \n"
     "SC-002 예시(execute, 기간 필터 — 데모 데이터는 2025년 4분기~2026년 2분기): "

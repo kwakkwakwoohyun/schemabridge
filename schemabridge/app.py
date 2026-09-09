@@ -207,27 +207,35 @@ def render_result(result: dict) -> None:
     st.write(clar["question"])
     answer = st.text_input("답변을 입력하세요", key=f"clarify_input_{clar['attempts']}")
     if st.button("답변 제출", key=f"clarify_submit_{clar['attempts']}") and answer:
-        with st.spinner("답변을 반영해서 재판정 중 (Azure OpenAI 호출)..."):
+        with st.status("답변 반영 중...", expanded=True) as status:
+            status.write(f'🤖 rescore_with_clarification 호출 중 (Azure OpenAI)... — 답변: "{answer}"')
             updated_scores = rescore_with_clarification(result["to_be_column"], clar["ranked_result"], answer)
+            status.write("✅ 점수 재산정 완료")
+            status.write("🔎 judge_and_rank 재판정 중...")
             rejudged = judge_and_rank(updated_scores, code_results)
-        clar["ranked_result"] = rejudged["ranked_result"]
-        clar["status"] = rejudged["status"]
-        clar["winner"] = rejudged["winner"]
-        clar["confidence_gap"] = rejudged["confidence_gap"]
-        clar["attempts"] += 1
-        clar["answers"].append(answer)
-        if clar["status"] == "confirmed":
-            with st.spinner("근거 문장 생성 중 (Azure OpenAI 호출)..."):
+            status.write(f"✅ 재판정 결과: {rejudged['status']}")
+            clar["ranked_result"] = rejudged["ranked_result"]
+            clar["status"] = rejudged["status"]
+            clar["winner"] = rejudged["winner"]
+            clar["confidence_gap"] = rejudged["confidence_gap"]
+            clar["attempts"] += 1
+            clar["answers"].append(answer)
+            if clar["status"] == "confirmed":
+                status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
                 clar["final_rationale"] = generate_rationale(
                     result["to_be_column"], clar["winner"], ranked_result=clar["ranked_result"],
                     clarification_answers=clar["answers"],
                 )
-            clar["question"] = None
-        elif clar["attempts"] < MAX_ATTEMPTS:
-            with st.spinner("다음 질문 생성 중..."):
+                status.write("✅ generate_rationale 완료 — CONFIRMED")
+                clar["question"] = None
+            elif clar["attempts"] < MAX_ATTEMPTS:
+                status.write("🤖 다음 질문 생성 중 (Azure OpenAI)...")
                 clar["question"] = build_clarification_question(result["to_be_column"], clar["ranked_result"])
-        else:
-            clar["question"] = None
+                status.write("✅ 다음 질문 준비 완료")
+            else:
+                clar["question"] = None
+                status.write("⚠️ 재시도 소진 — 최종 종료")
+            status.update(label="답변 반영 완료", state="complete", expanded=True)
         st.rerun()
 
 
@@ -270,15 +278,25 @@ def render_report_result(result: dict) -> None:
     st.table(rows)
 
 
-def run_sc001(to_be_column: str) -> dict:
+def run_sc001(to_be_column: str, status) -> dict:
+    status.write(f"🔎 lookup_mapping_candidates 조회 중 — `{to_be_column}`")
     lookup_result = lookup_mapping_candidates(to_be_column)
 
     if lookup_result["status_hint"] in ("no_match", "version_mismatch"):
+        status.write(f"⚠️ {lookup_result['status_hint']} — 판정 종료")
         return {"kind": "exception", "to_be_column": to_be_column, "lookup_result": lookup_result}
+    status.write(f"✅ AS-IS 후보 {len(lookup_result['candidates'])}건 확인")
 
+    status.write("🔎 filter_by_type 타입 필터링 중...")
     filter_result = filter_by_type(to_be_column, lookup_result["candidates"])
+    status.write(f"✅ 타입 통과 후보 {len(filter_result['filtered'])}건")
+
+    status.write("🔎 check_code_match 코드값 일치 확인 중...")
     code_results = check_code_match(filter_result["filtered"])
-    status = preliminary_status(lookup_result, filter_result, code_results)
+    matched_n = len([r for r in code_results if r["matched"]])
+    status.write(f"✅ 코드값 일치 후보 {matched_n}건")
+
+    result_status = preliminary_status(lookup_result, filter_result, code_results)
 
     result = {
         "kind": "normal",
@@ -286,14 +304,16 @@ def run_sc001(to_be_column: str) -> dict:
         "lookup_result": lookup_result,
         "filter_result": filter_result,
         "code_results": code_results,
-        "status": status,
+        "status": result_status,
         "clarification": None,
     }
 
-    if "PENDING" in status:
-        with st.spinner("infer_secondary_evidence 실행 중 (Azure OpenAI 호출)..."):
-            evidence_result = infer_secondary_evidence(to_be_column, filter_result["filtered"])
+    if "PENDING" in result_status:
+        status.write("🤖 infer_secondary_evidence 호출 중 (Azure OpenAI)...")
+        evidence_result = infer_secondary_evidence(to_be_column, filter_result["filtered"])
+        status.write("✅ infer_secondary_evidence 완료 — 후보별 점수 산출")
         judged = judge_and_rank(evidence_result["evidence_scores"], code_results)
+        status.write(f"✅ judge_and_rank 판정: {judged['status']}")
         clarification = {
             "ranked_result": judged["ranked_result"],
             "status": judged["status"],
@@ -305,43 +325,50 @@ def run_sc001(to_be_column: str) -> dict:
             "final_rationale": None,
         }
         if judged["status"] == "confirmed":
-            with st.spinner("근거 문장 생성 중 (Azure OpenAI 호출)..."):
-                clarification["final_rationale"] = generate_rationale(
-                    to_be_column, judged["winner"], ranked_result=judged["ranked_result"]
-                )
+            status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
+            clarification["final_rationale"] = generate_rationale(
+                to_be_column, judged["winner"], ranked_result=judged["ranked_result"]
+            )
+            status.write("✅ generate_rationale 완료 — CONFIRMED")
         else:
-            with st.spinner("되물을 질문 생성 중 (Azure OpenAI 호출)..."):
-                clarification["question"] = build_clarification_question(to_be_column, judged["ranked_result"])
+            status.write("🤖 되물을 질문 생성 중 (Azure OpenAI)...")
+            clarification["question"] = build_clarification_question(to_be_column, judged["ranked_result"])
+            status.write("✅ 되묻기 질문 준비 완료")
         result["clarification"] = clarification
-    elif "confirmed" in status:
+    elif "confirmed" in result_status:
         # 결정적 로직(단일 후보 / 코드값 일치)만으로 이미 확정된 경우.
         if len(filter_result["filtered"]) == 1:
             winner = filter_result["filtered"][0]
         else:
             matched_keys = {(r["table"], r["column"]) for r in code_results if r["matched"]}
             winner = next(c for c in filter_result["filtered"] if (c["table"], c["column"]) in matched_keys)
-        with st.spinner("근거 문장 생성 중 (Azure OpenAI 호출)..."):
-            result["final_rationale"] = generate_rationale(to_be_column, winner)
+        status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
+        result["final_rationale"] = generate_rationale(to_be_column, winner)
+        status.write("✅ generate_rationale 완료 — CONFIRMED")
         result["winner"] = winner
 
     return result
 
 
-def run_sc001_reverse(as_is_column: str) -> dict:
+def run_sc001_reverse(as_is_column: str, status) -> dict:
     """SC-001 역방향(AS-IS -> TO-BE, 2026-09-08 추가). lookup_reverse_mapping은
     매핑정의서 역인덱스 조회라 후보 랭킹이 필요 없다(현재 데이터 기준 matches는
     0건 또는 1건) — filter_by_type/check_code_match/infer_secondary_evidence/
     judge_and_rank를 태우지 않고 바로 확정하거나 no_match/ambiguous로 끝낸다."""
     as_is_table, as_is_col = as_is_column.split(".", 1)
+    status.write(f"🔎 lookup_reverse_mapping 역인덱스 조회 중 — `{as_is_column}`")
     reverse_result = lookup_reverse_mapping(as_is_table, as_is_col)
 
     if len(reverse_result["matches"]) != 1:
+        status.write(f"⚠️ matches {len(reverse_result['matches'])}건 — 확정 불가")
         return {"kind": "reverse_exception", "as_is_column": as_is_column, "reverse_result": reverse_result}
+    status.write("✅ TO-BE 매핑 1건 확정")
 
     winner_to_be_column = reverse_result["matches"][0]["to_be_column"]
     winner = {"table": as_is_table, "column": as_is_col}
-    with st.spinner("근거 문장 생성 중 (Azure OpenAI 호출)..."):
-        rationale = generate_rationale(winner_to_be_column, winner)
+    status.write("🤖 generate_rationale 호출 중 (Azure OpenAI)...")
+    rationale = generate_rationale(winner_to_be_column, winner)
+    status.write("✅ generate_rationale 완료 — CONFIRMED")
 
     return {
         "kind": "reverse_normal",
@@ -351,11 +378,12 @@ def run_sc001_reverse(as_is_column: str) -> dict:
     }
 
 
-def run_sc002(user_request: str, sc002_mode: str | None) -> dict:
-    with st.spinner("search_schema 실행 중 (조인 규칙 조회 + SC-001 도구로 재검증)..."):
-        schema_result = search_schema()
+def run_sc002(user_request: str, sc002_mode: str | None, status) -> dict:
+    status.write("🔎 search_schema 조회 중 — 조인 규칙 조회 + 구조 재검증")
+    schema_result = search_schema()
 
     if not schema_result["found"]:
+        status.write("⚠️ mapping_not_ready — 리포트 정의 없음/검증 실패")
         return {
             "kind": "report",
             "user_request": user_request,
@@ -363,12 +391,14 @@ def run_sc002(user_request: str, sc002_mode: str | None) -> dict:
             "reason": schema_result.get("validation_error")
             or "사전 정의된 리포트/조인 규칙이 없음 — SC-001에서 매핑을 먼저 확정해야 함",
         }
+    status.write("✅ search_schema 완료 — 리포트/소스 검증됨")
 
     join_rule = schema_result["join_rule"]
 
     if sc002_mode == "explore":
         # 실제 쿼리를 만들거나 실행하지 않고, search_schema가 이미 검증해 둔
         # 테이블/컬럼 정보만 보여준다 — generate_sql/execute_sql은 부르지 않는다.
+        status.write("ℹ️ sc002_mode=explore — 쿼리 생성/실행 없이 테이블 정보만 반환")
         return {
             "kind": "report",
             "user_request": user_request,
@@ -390,11 +420,14 @@ def run_sc002(user_request: str, sc002_mode: str | None) -> dict:
     attempts_log = []
 
     for attempt in range(1, MAX_SQL_ATTEMPTS + 1):
-        with st.spinner(f"generate_sql 실행 중 (Azure OpenAI 호출, {attempt}/{MAX_SQL_ATTEMPTS}회차)..."):
-            sql = generate_sql(schema_chunks, user_request, sql_error)["sql"]
+        status.write(f"🤖 generate_sql 호출 중 (Azure OpenAI, {attempt}/{MAX_SQL_ATTEMPTS}회차)...")
+        sql = generate_sql(schema_chunks, user_request, sql_error)["sql"]
+        status.write(f"✅ generate_sql 완료 ({attempt}회차)")
 
+        status.write("🔎 validate_readonly 검증 중...")
         validation = validate_readonly(sql)
         if not validation["is_valid"]:
+            status.write(f"⚠️ readonly_violation — {validation['reason']}")
             return {
                 "kind": "report",
                 "user_request": user_request,
@@ -402,11 +435,13 @@ def run_sc002(user_request: str, sc002_mode: str | None) -> dict:
                 "reason": validation["reason"],
                 "sql": sql,
             }
+        status.write("✅ Read-only 검증 통과")
 
-        with st.spinner(f"execute_sql 실행 중 ({attempt}/{MAX_SQL_ATTEMPTS}회차)..."):
-            exec_result = execute_sql(sql)
+        status.write(f"🗄️ execute_sql 실행 중 ({attempt}/{MAX_SQL_ATTEMPTS}회차)...")
+        exec_result = execute_sql(sql)
 
         if exec_result["error"] is None:
+            status.write(f"✅ execute_sql 성공 — {len(exec_result['rows'])}행")
             return {
                 "kind": "report",
                 "user_request": user_request,
@@ -418,9 +453,11 @@ def run_sc002(user_request: str, sc002_mode: str | None) -> dict:
                 "attempts": attempt,
             }
 
+        status.write(f"⚠️ execute_sql 실패({attempt}회차) — {exec_result['error']}")
         attempts_log.append({"sql": sql, "error": exec_result["error"]})
         sql_error = exec_result["error"]
 
+    status.write("⚠️ sql_execution_failed — 재시도 소진")
     return {
         "kind": "report",
         "user_request": user_request,
@@ -455,18 +492,28 @@ st.caption(
 )
 
 if st.button("실행", type="primary") and user_request:
-    with st.spinner("classify_intent 실행 중 (Azure OpenAI 호출)..."):
+    # st.spinner는 메시지 하나만 떴다가 사라져서 처리 과정이 안 남는다는 피드백(2026-09-09)에
+    # 따라, st.status()로 바꿔 각 단계 로그가 지워지지 않고 아래로 계속 쌓이도록 함.
+    with st.status("SchemaBridge 처리 중...", expanded=True) as status:
+        status.write("🤖 classify_intent 호출 중 (Azure OpenAI)...")
         classified = classify_intent(user_request)
+        intent_summary = f"✅ classify_intent 완료 — intent={classified['intent']}"
+        if classified["intent"] == "SC-002":
+            intent_summary += f", sc002_mode={classified['sc002_mode']}"
+        status.write(intent_summary)
 
-    if classified["intent"] == "SC-001":
-        if classified["to_be_column"]:
-            st.session_state.result = run_sc001(classified["to_be_column"])
-        elif classified["as_is_column"]:
-            st.session_state.result = run_sc001_reverse(classified["as_is_column"])
+        if classified["intent"] == "SC-001":
+            if classified["to_be_column"]:
+                st.session_state.result = run_sc001(classified["to_be_column"], status)
+            elif classified["as_is_column"]:
+                st.session_state.result = run_sc001_reverse(classified["as_is_column"], status)
+            else:
+                status.write("⚠️ 방향(TO-BE/AS-IS)을 판별할 수 없음")
+                st.session_state.result = {"kind": "direction_ambiguous"}
         else:
-            st.session_state.result = {"kind": "direction_ambiguous"}
-    else:
-        st.session_state.result = run_sc002(user_request, classified["sc002_mode"])
+            st.session_state.result = run_sc002(user_request, classified["sc002_mode"], status)
+
+        status.update(label="처리 완료", state="complete", expanded=True)
 
 # 렌더링은 버튼 클릭 여부와 무관하게 항상 session_state를 기준으로 그린다 —
 # "답변 제출" 버튼을 눌러 재실행됐을 때도 지금까지의 진행 상황이 이어지도록.

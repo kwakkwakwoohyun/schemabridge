@@ -223,9 +223,22 @@ def generate_reverse_rationale_node(state: AgentState) -> dict:
 def lookup_node(state: AgentState) -> dict:
     result = lookup_mapping_candidates(state["to_be_column"])
     # lookup_mapping_candidates 를 실행하고 result의 status_hint 값을 보고 다음 노드는 어디로갈지 판단.
-    # no_match(매핑정의서에 등록 자체가 없음)만 탐색으로 보낸다(2026-09-09 추가) — version_mismatch
-    # (등록은 있는데 그 AS-IS 컬럼이 스키마에서 사라짐)는 탐색 대상이 아니라 그대로 예외 처리.
+    # no_match는 두 경우를 다 포함한다: (a) TO-BE 컬럼 자체가 현재 스키마에 없음(오타 등),
+    # (b) 컬럼은 실존하는데 매핑정의서에 등록만 안 돼 있음. lookup_reverse_node가 역방향에서
+    # 이미 하던 방식과 대칭으로(2026-09-11 추가), 여기서도 실제 존재 여부를 한 번 더 확인해
+    # (a)는 탐색 없이 곧장 예외 처리하고(존재하지 않는 컬럼을 탐색하는 건 의미가 없음),
+    # (b)만 discover_as_is_candidates로 보낸다. version_mismatch(등록은 있는데 그 AS-IS
+    # 컬럼이 스키마에서 사라짐)는 원래부터 탐색 대상이 아니라 그대로 예외 처리.
     if result["status_hint"] == "no_match":
+        to_be_table, to_be_col = state["to_be_column"].split(".", 1)
+        schema = load_schema()
+        if get_column_info(schema, "TO-BE", to_be_table, to_be_col) is None:
+            return {
+                "candidates": result["candidates"],
+                "source_version": result["source_version"],
+                "status_hint": "column_not_found",
+                "route": "handle_exception",
+            }
         route = "discover_as_is_candidates"
     elif result["status_hint"] == "version_mismatch":
         route = "handle_exception"
@@ -424,9 +437,15 @@ def handle_exception_node(state: AgentState) -> dict:
             },
         }
 
-    if state.get("status_hint") in ("no_match", "version_mismatch"):
+    if state.get("status_hint") in ("no_match", "version_mismatch", "column_not_found"):
         status = state["status_hint"]
-        if status == "no_match" and state.get("discovered"):
+        if status == "column_not_found":
+            # TO-BE 컬럼 자체가 스키마에 없음(오타 등) — 탐색조차 의미가 없어 바로 여기로
+            # 라우팅됨(lookup_node, 2026-09-11 추가). status는 no_match와 동일하게 노출하되
+            # 이유만 구분해서, "등록이 안 됐을 뿐 실존하는 컬럼"과 헷갈리지 않게 한다.
+            status = "no_match"
+            reason = f"'{state['to_be_column']}' 컬럼 자체가 TO-BE 스키마에 존재하지 않습니다(오타이거나 잘못된 컬럼명일 수 있습니다)."
+        elif status == "no_match" and state.get("discovered"):
             reason = "매핑정의서에 등록이 없어 반대편 스키마 전체를 탐색했지만, 타입이 맞는 후보조차 하나도 없음"
         elif status == "no_match":
             reason = "매핑정의서에 해당 TO-BE 컬럼 자체가 없음"

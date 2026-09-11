@@ -33,6 +33,24 @@ AS-IS LBR_WHT/INT_WHT 양쪽에 다 있고, acct_nm은 AS-IS INT_WHT/DIV_WHT 두
 적용한 것이다. 그래프는 이 경우를 "direction_ambiguous"로 받아 handle_exception이
 사용자에게 테이블명을 포함해 다시 질문해달라고 안내한다(src/graph.py 참고).
 
+**2026-09-11 추가 — 순수 식별자('TABLE.column' 전체 일치) 입력은 LLM 없이 결정적으로
+방향을 판별한다.** "뜬금없는 테이블에 컬럼을 물어보면 판단을 못 한다"는 사용자 지적으로
+드러난 버그: 실존하지만 컬럼명이 잘못된(예: ACC_WHT_AGG.completely_fake_column) 입력이
+"진짜 테이블/방향 자체가 불분명한 경우"와 똑같이 direction_ambiguous로 뭉뚱그려졌다.
+LLM에게 스키마 목록을 통째로 주고 "이 컬럼이 목록에 있는지"까지 판단시키다 보니, 컬럼이
+목록에 없으면 테이블이 명백해도 방향 판단 자체를 포기해버린 것. 하지만 테이블명은
+TO-BE/AS-IS 두 스키마 사이에 절대 겹치지 않는다고 이미 확인돼 있으므로(4주차 설계 기준
+TO-BE 3개 테이블, AS-IS 5개 테이블), 입력이 "TABLE.column" 형태 전체와 정확히 일치하면
+테이블명이 어느 스키마에 속하는지만 보고 방향을 그대로 결정할 수 있다 — 컬럼이 실제로
+존재하는지는 여기서 판단하지 않고(그건 lookup_mapping_candidates/lookup_reverse_mapping의
+몫), 순수하게 "TO-BE 쪽 질문이냐 AS-IS 쪽 질문이냐"만 스키마 조회로 결정한다
+(_resolve_qualified_identifier). 이 사전 체크가 걸리면 LLM을 아예 호출하지 않으므로,
+기존에 알려져 있던 "ACC_WHT_AGG.settle_method_cd처럼 완전한 식별자를 줘도 호출마다
+direction_ambiguous가 나올 수 있다"는 별개의 비결정성 이슈도 이 경로에 한해 함께
+해소된다. 테이블명 자체를 모르면(오타난 테이블명, FOO_TABLE 같은 완전히 없는 테이블)
+기존과 동일하게 LLM 판단으로 넘어간다 — 이 경우는 원래도 정상적으로
+direction_ambiguous로 처리되고 있었다.
+
 **2026-09-07 추가 — SC-002 안에서도 "탐색" vs "실행"을 구분한다(`sc002_mode`).**
 처음엔 SC-002로 분류되면 무조건 search_schema -> generate_sql -> execute_sql까지
 끝까지 실행해서 SQL과 결과를 보여줬는데, "원천세 집계 관련된 테이블 다 찾아줘"처럼
@@ -46,8 +64,12 @@ AS-IS LBR_WHT/INT_WHT 양쪽에 다 있고, acct_nm은 AS-IS INT_WHT/DIV_WHT 두
 src/schema_search.py, app.py 참고). SC-001이면 sc002_mode는 null.
 """
 
+import re
+
 from src.data_loader import load_schema
 from src.llm_client import chat_completion_json
+
+_QUALIFIED_IDENTIFIER_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$")
 
 INTENT_SCHEMA = {
     "name": "classified_intent",
@@ -84,7 +106,31 @@ def _as_is_schema_context() -> str:
     return "\n".join(lines)
 
 
+def _resolve_qualified_identifier(user_request: str) -> dict | None:
+    """입력이 'TABLE.column' 형태 전체와 정확히 일치하면, 테이블명만 보고 TO-BE/AS-IS
+    방향을 결정적으로 판별한다(LLM 미사용). 컬럼이 실제로 존재하는지는 여기서 확인하지
+    않는다 — 그건 이후 lookup_mapping_candidates/lookup_reverse_mapping의 몫이다.
+    테이블명이 어느 스키마에도 없으면(오타, 완전히 모르는 테이블) None을 반환해
+    LLM 기반 판단으로 넘긴다.
+    """
+    match = _QUALIFIED_IDENTIFIER_RE.match(user_request.strip())
+    if not match:
+        return None
+    table, column = match.group(1), match.group(2)
+    identifier = f"{table}.{column}"
+    schema = load_schema()
+    if table in schema.get("TO-BE", {}):
+        return {"intent": "SC-001", "to_be_column": identifier, "as_is_column": None, "sc002_mode": None}
+    if table in schema.get("AS-IS", {}):
+        return {"intent": "SC-001", "to_be_column": None, "as_is_column": identifier, "sc002_mode": None}
+    return None
+
+
 def classify_intent(user_request: str) -> dict:
+    deterministic = _resolve_qualified_identifier(user_request)
+    if deterministic is not None:
+        return deterministic
+
     prompt = (
         f"사용자 입력: \"{user_request}\"\n\n"
         "이 입력이 다음 중 무엇을 원하는지 의미로 판단해라(문장이냐 식별자냐 같은 "
